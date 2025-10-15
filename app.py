@@ -71,3 +71,11 @@ async def analyze_url(payload: dict = Body(...)):
     finally:
         try: os.remove(tmp_path)
         except Exception: pass
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "ai-video-detector"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
