@@ -4,3 +4,4 @@ def score_audio(info):
     if not audio_streams:
         return {"score":0.55, "notes":["No audio stream"]}
     return {"score":0.45, "notes":["Audio present (placeholder)"]}
+
