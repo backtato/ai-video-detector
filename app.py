@@ -1,5 +1,4 @@
 import os
-import re
 import tempfile
 from fastapi import FastAPI, UploadFile, File, Body
 from fastapi.responses import JSONResponse
@@ -16,7 +15,7 @@ from calibration import calibrate, combine_scores
 from detectors.metadata import ffprobe, score_metadata
 from detectors.frame_artifacts import score_frame_artifacts
 from detectors.audio import score_audio
-from utils import extract_frames, video_duration_fps
+from utils import extract_frames_evenly, video_duration_fps
 from resolver import resolve_to_tempfile
 
 # Context analyzer (YouTube)
@@ -34,14 +33,27 @@ def label_from(p: float) -> str:
     return "Inconclusive"
 
 def run_pipeline(tmp_path: str):
+    # Probe robusta: durata/fps/frame_count affidabili
     duration, fps, frame_count = video_duration_fps(tmp_path)
-    info = ffprobe(tmp_path)
 
+    # Analisi metadata
+    info = ffprobe(tmp_path)
     md = score_metadata(info)
-    frames = extract_frames(tmp_path, max_frames=64, stride=max(1, int(fps // 6) if fps else 4))
-    fa = score_frame_artifacts(frames)
+
+    # Campionamento UNIFORME per evitare stride dipendenti da fps errati
+    frames = extract_frames_evenly(tmp_path, max_frames=64)
+    analyzed = len(frames)
+
+    # Frame artifacts con "airbag": nessun 500 se qualcosa va storto
+    try:
+        fa = score_frame_artifacts(frames)
+    except Exception as e:
+        fa = {"score": 0.6, "notes": [f"frame_artifacts error: {e}"]}
+
+    # Audio (placeholder)
     au = score_audio(info)
 
+    # Ensemble euristico MVP
     raw_weighted = {
         "metadata": (md["score"], ENSEMBLE_WEIGHTS["metadata"]),
         "frame_artifacts": (fa["score"], ENSEMBLE_WEIGHTS["frame_artifacts"]),
@@ -50,10 +62,12 @@ def run_pipeline(tmp_path: str):
     raw_score = combine_scores(raw_weighted)
     ai_plaus = calibrate(raw_score, CALIBRATION["a"], CALIBRATION["b"])
 
-    enough_frames = frame_count >= MIN_FRAMES_FOR_CONFIDENCE and duration >= MIN_DURATION_SEC
-    confidence = 0.3 + 0.7 * min(1.0, (frame_count / 120.0 if frame_count else 0.0))
+    # Confidence sui frame ANALIZZATI (non su quelli “teorici”)
+    enough_frames = analyzed >= MIN_FRAMES_FOR_CONFIDENCE and duration >= MIN_DURATION_SEC
+    confidence = 0.3 + 0.7 * min(1.0, (analyzed / 120.0 if analyzed else 0.0))
     if not enough_frames:
         confidence *= 0.6
+    confidence = min(confidence, 0.99)  # niente 100% nel MVP
 
     return {
         "ai_plausibility": round(float(ai_plaus), 4),
@@ -64,7 +78,12 @@ def run_pipeline(tmp_path: str):
             "frame_artifacts": {"score": fa["score"], "notes": fa.get("notes", [])},
             "audio": {"score": au["score"], "notes": au.get("notes", [])},
         },
-        "video_info": {"duration_sec": duration, "fps": fps, "frame_count": frame_count},
+        "video_info": {
+            "duration_sec": duration,
+            "fps": fps,
+            "frame_count": frame_count,
+            "frames_analyzed": analyzed
+        },
     }
 
 # --------------------------- Health ---------------------------
