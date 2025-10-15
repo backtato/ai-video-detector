@@ -9,6 +9,7 @@ from detectors.frame_artifacts import score_frame_artifacts
 from detectors.audio import score_audio
 from utils import extract_frames, video_duration_fps
 from resolver import resolve_to_tempfile
+from social_context import is_youtube_url, extract_youtube_id, youtube_context_score
 
 app = FastAPI(title="AI Video Plausibility Detector (Resolver)")
 
@@ -90,3 +91,35 @@ async def analyze_url(payload: dict = Body(...)):
         try: os.remove(tmp_path)
         except Exception: pass
 
+@app.post("/analyze-link")
+async def analyze_link(payload: dict = Body(...)):
+    """
+    Context-only analysis for social links (YouTube supported in MVP).
+    Returns a context score and label; NOT a pixel/content verdict.
+    """
+    url = (payload.get("url") or "").strip()
+    if not url:
+        return JSONResponse({"error":"Missing url"}, status_code=400)
+
+    # YouTube
+    if is_youtube_url(url):
+        vid = extract_youtube_id(url)
+        if not vid:
+            return JSONResponse({"error":"Unable to extract YouTube videoId"}, status_code=400)
+        try:
+            ctx = youtube_context_score(vid)
+        except Exception as e:
+            return JSONResponse({"error": f"YouTube context failed: {e}"}, status_code=502)
+        # map to response
+        return JSONResponse({
+            "context_only": True,
+            "platform": ctx["platform"],
+            "video_id": ctx["video_id"],
+            "context_trust_score": ctx["score"],   # 0..1
+            "context_label": ctx["context_label"], # "Context suggests authentic" / "Context suspicious" / "Context inconclusive"
+            "context_signals": ctx["signals"],
+            "label": "Not assessable (content unavailable)"
+        })
+
+    # Other platforms → unsupported in MVP
+    return JSONResponse({"error":"Unsupported platform for context analysis (MVP supports YouTube)."}, status_code=400)
