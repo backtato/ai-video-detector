@@ -9,6 +9,7 @@ def ffprobe(path):
         return json.loads(out.decode("utf-8"))
     except Exception:
         return {}
+
 def score_metadata(info):
     score=0.5; notes=[]
     try:
