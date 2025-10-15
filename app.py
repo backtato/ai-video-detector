@@ -2,7 +2,7 @@ import os, tempfile
 from fastapi import FastAPI, UploadFile, File, Body
 from fastapi.responses import JSONResponse
 
-from config import ENSEMBLE_WEIGHTS, CALIBRATION, MIN_FRAMES_FOR_CONFIDENCE, MIN_DURATION_SEC
+from config import ENSEMBLE_WEIGHTS, CALIBRATION, MIN_FRAMES_FOR_CONFIDENCE, MIN_DURATION_SEC, THRESH_AI, THRESH_ORIGINAL
 from calibration import calibrate, combine_scores
 from detectors.metadata import ffprobe, score_metadata
 from detectors.frame_artifacts import score_frame_artifacts
@@ -12,6 +12,11 @@ from resolver import resolve_to_tempfile
 
 app = FastAPI(title="AI Video Plausibility Detector (Resolver)")
 
+def label_from(p: float) -> str:
+    if p >= THRESH_AI: return "Likely AI"
+    if p < THRESH_ORIGINAL: return "Likely Original"
+    return "Inconclusive"
+
 def run_pipeline(tmp_path: str):
     duration, fps, frame_count = video_duration_fps(tmp_path)
     info = ffprobe(tmp_path)
@@ -19,6 +24,7 @@ def run_pipeline(tmp_path: str):
     frames = extract_frames(tmp_path, max_frames=64, stride= max(1, int(fps//6) if fps>0 else 4))
     fa = score_frame_artifacts(frames)
     au = score_audio(info)
+
     raw_weighted = {
         "metadata": (md["score"], ENSEMBLE_WEIGHTS["metadata"]),
         "frame_artifacts": (fa["score"], ENSEMBLE_WEIGHTS["frame_artifacts"]),
@@ -26,12 +32,16 @@ def run_pipeline(tmp_path: str):
     }
     raw_score = combine_scores(raw_weighted)
     ai_plaus = calibrate(raw_score, CALIBRATION["a"], CALIBRATION["b"])
+
     enough_frames = frame_count >= MIN_FRAMES_FOR_CONFIDENCE and duration >= MIN_DURATION_SEC
     confidence = 0.3 + 0.7 * min(1.0, (frame_count / 120.0))
-    if not enough_frames: confidence *= 0.6
+    if not enough_frames:
+        confidence *= 0.6
+
     return {
         "ai_plausibility": round(float(ai_plaus), 4),
         "confidence": round(float(confidence), 4),
+        "label": label_from(float(ai_plaus)),
         "explanations": {
             "metadata": {"score": md["score"], "notes": md.get("notes", [])},
             "frame_artifacts": {"score": fa["score"], "notes": fa.get("notes", [])},
@@ -39,6 +49,14 @@ def run_pipeline(tmp_path: str):
         },
         "video_info": {"duration_sec": duration, "fps": fps, "frame_count": frame_count},
     }
+
+@app.get("/")
+def root():
+    return {"status":"ok","service":"ai-video-detector"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
@@ -62,7 +80,7 @@ async def analyze_url(payload: dict = Body(...)):
     try:
         tmp_path = resolve_to_tempfile(url)
     except Exception as e:
-        return JSONResponse({"error": f"Resolver failed: {e}"}, status_code=400)
+        return JSONResponse({"error": f"Resolver failed: {e}", "label":"Not assessable (content unavailable)"}, status_code=400)
     try:
         resp = run_pipeline(tmp_path)
         resp["notes"] = ["URL resolver used; only public/direct media resolved.", "MVP heuristics; replace with trained models."]
@@ -71,11 +89,3 @@ async def analyze_url(payload: dict = Body(...)):
     finally:
         try: os.remove(tmp_path)
         except Exception: pass
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "ai-video-detector"}
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
