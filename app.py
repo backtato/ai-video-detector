@@ -1,4 +1,4 @@
-import os
+ import os
 import re
 import tempfile
 import requests
@@ -19,6 +19,9 @@ from detectors.frame_artifacts import score_frame_artifacts
 from detectors.audio import score_audio
 from utils import extract_frames, video_duration_fps
 from resolver import resolve_to_tempfile
+
+# NEW: import context analyzer
+from social_context import is_youtube_url, extract_youtube_id, youtube_context_score
 
 app = FastAPI(title="AI Video Plausibility Detector (Resolver)")
 
@@ -85,9 +88,7 @@ async def analyze(file: UploadFile = File(...)):
         tmp_path = tmp.name
     try:
         resp = run_pipeline(tmp_path)
-        resp["notes"] = [
-            "MVP heuristics; replace with trained models.",
-        ]
+        resp["notes"] = ["MVP heuristics; replace with trained models."]
         return JSONResponse(resp)
     finally:
         try:
@@ -100,14 +101,15 @@ async def analyze_url(payload: dict = Body(...)):
     url = (payload.get("url") or "").strip()
     if not url:
         return JSONResponse({"error": "Missing url"}, status_code=400)
+
     try:
         tmp_path = resolve_to_tempfile(url)
     except Exception as e:
-        # Non scaricabile legalmente o non è un media pubblico
         return JSONResponse(
             {"error": f"Resolver failed: {e}", "label": "Not assessable (content unavailable)"},
             status_code=400,
         )
+
     try:
         resp = run_pipeline(tmp_path)
         resp["notes"] = [
@@ -126,85 +128,6 @@ async def analyze_url(payload: dict = Body(...)):
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
 
-def extract_youtube_id(url: str):
-    # ?v=ID
-    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url)
-    if m:
-        return m.group(1)
-    # youtu.be/ID
-    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
-    if m:
-        return m.group(1)
-    # youtube.com/shorts/ID
-    m = re.search(r"youtube\.com/shorts/([A-Za-z0-9_-]{11})", url)
-    if m:
-        return m.group(1)
-    return None
-
-def youtube_context_score(video_id: str) -> dict:
-    # 1) Video details
-    vi = requests.get(
-        "https://www.googleapis.com/youtube/v3/videos",
-        params={"part": "snippet,contentDetails,statistics,status", "id": video_id, "key": YOUTUBE_API_KEY},
-        timeout=10,
-    ).json()
-    items = vi.get("items", [])
-    if not items:
-        return {"score": 50, "signals": ["Video not found or private"], "platform": "youtube"}
-
-    v = items[0]
-    snip = v.get("snippet", {})
-    ch_id = snip.get("channelId")
-    title = (snip.get("title") or "").lower()
-    description = (snip.get("description") or "").lower()
-
-    # 2) Channel stats (heuristics)
-    subs = 0
-    ch_age_years = 0.0
-    if ch_id:
-        ch = requests.get(
-            "https://www.googleapis.com/youtube/v3/channels",
-            params={"part": "snippet,statistics,status", "id": ch_id, "key": YOUTUBE_API_KEY},
-            timeout=10,
-        ).json()
-        chi = (ch.get("items") or [])
-        if chi:
-            c = chi[0]
-            subs = int(c.get("statistics", {}).get("subscriberCount", 0) or 0)
-            published = c.get("snippet", {}).get("publishedAt", "")
-            try:
-                from datetime import datetime, timezone
-                if published:
-                    dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
-                    ch_age_years = max(0.0, (datetime.now(timezone.utc) - dt).days / 365.25)
-            except Exception:
-                pass
-
-    # 3) Heuristic context score 0..100
-    score = 50
-    signals = []
-    # audience signals
-    if subs > 1_000_000:
-        score += 10; signals.append("Large audience channel")
-    elif subs > 100_000:
-        score += 6; signals.append("Significant audience channel")
-    elif subs < 1_000:
-        score -= 5; signals.append("Very small audience")
-    # age signals
-    if ch_age_years >= 5:
-        score += 6; signals.append(f"Old channel (~{ch_age_years:.1f}y)")
-    elif ch_age_years < 0.5:
-        score -= 6; signals.append("Very new channel")
-    # content hints
-    clickbait_terms = ["shocking", "you won't believe", "gone wrong", "impossible", "ai generated"]
-    if any(t in title for t in clickbait_terms):
-        score -= 5; signals.append("Clickbait-like title")
-    if " ai " in f" {title} " or " ai " in f" {description} ":
-        signals.append("Mentions AI in title/description")
-
-    score = max(0, min(100, score))
-    return {"score": score, "signals": signals, "platform": "youtube"}
-
 @app.post("/analyze-link")
 def analyze_link(payload: dict = Body(...)):
     """
@@ -216,7 +139,7 @@ def analyze_link(payload: dict = Body(...)):
     if not url:
         return JSONResponse({"error": "Missing url"}, status_code=400)
 
-    if ("youtube.com" in url) or ("youtu.be" in url):
+    if is_youtube_url(url):
         if not YOUTUBE_API_KEY:
             return JSONResponse(
                 {"error": "Backend missing YOUTUBE_API_KEY env var",
@@ -230,16 +153,18 @@ def analyze_link(payload: dict = Body(...)):
                  "label": "Not assessable (content unavailable)"},
                 status_code=400,
             )
-        ctx = youtube_context_score(vid)
+        ctx = youtube_context_score(vid, api_key=YOUTUBE_API_KEY)
+        # mapping coerente con il plugin WP
         return JSONResponse({
             "label": "Not assessable (content unavailable)",
+            "context_only": True,
+            "platform": "youtube",
             "context_trust_score": round(ctx["score"] / 100.0, 4),
+            "context_label": ctx["label"],
             "context_signals": ctx["signals"],
-            "platform": ctx["platform"],
             "source_url": url,
         })
 
-    # Other platforms can be added here later (Instagram/TikTok APIs) – context-only.
     return JSONResponse(
         {"error": "Unsupported platform for analyze-link",
          "label": "Not assessable (content unavailable)"},
