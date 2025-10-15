@@ -1,163 +1,95 @@
-import os, re, tempfile, requests, subprocess, json
-from urllib.parse import urlparse, urljoin
-from bs4 import BeautifulSoup
+import os
+import re
+import socket
+import urllib.parse
+import tempfile
+import requests
+from contextlib import contextmanager
+from typing import Optional
 
-DEFAULT_MAX_BYTES = int(os.environ.get("RESOLVER_MAX_BYTES", "52428800"))  # 50 MB
-ALLOWED_DOMAINS = [d.strip().lower() for d in os.environ.get("RESOLVER_ALLOWLIST", "").split(",") if d.strip()]
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
+from config import RESOLVER_ALLOWLIST, RESOLVER_MAX_BYTES, FFMPEG_USER_AGENT, FFMPEG_RW_TIMEOUT_US, HLS_SAMPLE_SECONDS
 
-def is_domain_allowed(url: str) -> bool:
-    if not ALLOWED_DOMAINS:
-        return True
-    host = (urlparse(url).hostname or "").lower()
-    return any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
+PRIVATE_NETS = (
+    ("10.",),
+    ("172.", "16."),  # coarse check; sicurezza sufficiente per MVP
+    ("192.168.",),
+    ("127.",),
+)
 
-def head(url: str, timeout=8):
+def _is_private_ip(host: str) -> bool:
     try:
-        return requests.head(url, allow_redirects=True, timeout=timeout, headers={"User-Agent": UA})
-    except Exception:
-        return None
-
-def is_video_like_url(u: str) -> bool:
-    return bool(re.search(r"\.(mp4|webm|mov)(\?.*)?$", u, re.I))
-
-def is_video_response(resp) -> bool:
-    if not resp:
-        return False
-    ctype = (resp.headers or {}).get("Content-Type", "")
-    if ctype.startswith("video/"):
+        ip = socket.gethostbyname(host)
+    except socket.gaierror:
+        return True  # host non risolvibile: blocca
+    if ip == "::1":
         return True
-    disp = (resp.headers or {}).get("Content-Disposition", "")
-    return is_video_like_url(resp.url) or bool(re.search(r"\.mp4|\.webm|\.mov", disp, re.I))
+    return any(ip.startswith(prefix) for group in PRIVATE_NETS for prefix in group)
 
-def guess_suffix_from_headers(resp) -> str:
-    ctype = (resp.headers or {}).get("Content-Type", "")
-    if "mp4" in ctype or re.search(r"\.mp4(\?.*)?$", resp.url, re.I): return ".mp4"
-    if "webm" in ctype or re.search(r"\.webm(\?.*)?$", resp.url, re.I): return ".webm"
-    if "quicktime" in ctype or "mov" in ctype or re.search(r"\.mov(\?.*)?$", resp.url, re.I): return ".mov"
-    return ".bin"
+if RESOLVER_ALLOWLIST.strip():
+    _ALLOW = set(h.strip().lower() for h in RESOLVER_ALLOWLIST.split(",") if h.strip())
+    def is_allowed(url: str) -> bool:
+        u = urllib.parse.urlparse(url)
+        return u.scheme in ("http", "https") and (u.hostname or "").lower() in _ALLOW
+else:
+    # default permissivo ma sicuro
+    def is_allowed(url: str) -> bool:
+        u = urllib.parse.urlparse(url)
+        host = (u.hostname or "").lower()
+        if u.scheme not in ("http", "https") or not host:
+            return False
+        return not _is_private_ip(host)
 
-def download_to_temp(url: str, max_bytes: int = DEFAULT_MAX_BYTES, timeout=20, suffix=None):
-    with requests.get(url, stream=True, timeout=timeout, headers={"User-Agent": UA}) as r:
-        r.raise_for_status()
-        if suffix is None:
-            suffix = guess_suffix_from_headers(r)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        total = 0
-        for chunk in r.iter_content(chunk_size=65536):
-            if not chunk: continue
-            total += len(chunk)
-            if total > max_bytes:
-                tmp.close(); os.unlink(tmp.name)
-                raise ValueError("File exceeds max size")
-            tmp.write(chunk)
-        tmp.flush(); tmp.close()
-        return tmp.name
-
-def parse_json_ld_for_video(soup, base_url):
-    for tag in soup.find_all("script", attrs={"type":"application/ld+json"}):
-        try:
-            data = json.loads(tag.string or "")
-        except Exception:
+def _cap_stream_write(resp: requests.Response, tmp, cap_bytes: int) -> int:
+    total = 0
+    for chunk in resp.iter_content(chunk_size=65536):
+        if not chunk:
             continue
-        items = data if isinstance(data, list) else [data]
-        for it in items:
-            if isinstance(it, dict) and it.get("@type") in ("VideoObject","Clip"):
-                url = it.get("contentUrl") or it.get("contentURL")
-                if url:
-                    return urljoin(base_url, url)
-    return None
+        total += len(chunk)
+        if total > cap_bytes:
+            raise ValueError("MAX_BYTES_EXCEEDED")
+        tmp.write(chunk)
+    return total
 
-def extract_video_url_from_html(url: str, timeout=12):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": UA})
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    for key in ["og:video", "og:video:url", "og:video:secure_url"]:
-        og = soup.find("meta", attrs={"property": key})
-        if og and og.get("content"):
-            return urljoin(url, og["content"])
-    tw = soup.find("meta", attrs={"name":"twitter:player:stream"})
-    if tw and tw.get("content"):
-        return urljoin(url, tw["content"])
-    v = soup.find("video")
-    if v and v.get("src"):
-        return urljoin(url, v["src"])
-    s = soup.find("source")
-    if s and s.get("src"):
-        return urljoin(url, s["src"])
-    vjson = parse_json_ld_for_video(soup, url)
-    if vjson:
-        return vjson
-    return None
-
-def handle_hls_to_temp(m3u8_url: str, max_seconds: int = 8):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    tmp_path = tmp.name; tmp.close()
-    cmd = ["ffmpeg","-y","-hide_banner","-loglevel","error","-i",m3u8_url,"-t",str(max_seconds),"-c","copy",tmp_path]
+@contextmanager
+def download_to_temp(url: str, cap_bytes: int):
+    if not is_allowed(url):
+        raise PermissionError("URL not allowed by policy")
+    headers = {"User-Agent": "Mozilla/5.0 (AI-Video/1.0)"}
+    with requests.get(url, headers=headers, stream=True, timeout=(10, 30)) as r:
+        r.raise_for_status()
+        suffix = os.path.splitext(urllib.parse.urlparse(url).path)[1] or ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            try:
+                _cap_stream_write(r, tmp, cap_bytes)
+                path = tmp.name
+            except Exception:
+                tmp.close()
+                try: os.unlink(tmp.name)
+                except Exception: pass
+                raise
     try:
-        subprocess.check_call(cmd, timeout=60)
-    except subprocess.CalledProcessError:
-        cmd = ["ffmpeg","-y","-hide_banner","-loglevel","error","-i",m3u8_url,"-t",str(max_seconds),
-               "-c:v","libx264","-preset","veryfast","-c:a","aac",tmp_path]
-        subprocess.check_call(cmd, timeout=90)
-    if os.path.getsize(tmp_path) > DEFAULT_MAX_BYTES:
-        os.unlink(tmp_path); raise ValueError("HLS sample exceeds max size")
-    return tmp_path
+        yield path
+    finally:
+        try: os.unlink(path)
+        except Exception: pass
 
-def resolve_to_tempfile(url: str):
-    if not url.lower().startswith(("http://", "https://")):
-        raise ValueError("Only http/https supported")
-    if not is_domain_allowed(url):
-        raise ValueError("Domain not allowed")
-
-    # Explicit HLS/DASH
-    if re.search(r"\.m3u8(\?.*)?$", url, re.I):
-        return handle_hls_to_temp(url, max_seconds=8)
-    if re.search(r"\.mpd(\?.*)?$", url, re.I):
-        raise ValueError("DASH (.mpd) not supported in MVP")
-
-    # HEAD
-    h = head(url)
-    if h and is_video_response(h):
-        return download_to_temp(h.url, suffix=guess_suffix_from_headers(h))
-
-    # GET (some CDNs block HEAD)
-    try:
-        with requests.get(url, stream=True, timeout=10, headers={"User-Agent": UA}) as g:
-            ctype = g.headers.get("Content-Type","")
-            if ctype.startswith("video/") or is_video_like_url(g.url):
-                suffix = guess_suffix_from_headers(g)
-                # quick probe (discarded) to verify reachability
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                written = 0
-                for chunk in g.iter_content(chunk_size=65536):
-                    if not chunk: continue
-                    written += len(chunk)
-                    if written > min(DEFAULT_MAX_BYTES, 4*1024*1024):
-                        break
-                    tmp.write(chunk)
-                tmp.flush(); tmp.close()
-                os.unlink(tmp.name)
-                return download_to_temp(url, suffix=suffix)
-    except Exception:
-        pass
-
-    # Parse HTML for video url
-    try:
-        vurl = extract_video_url_from_html(url)
-        if vurl:
-            if re.search(r"\.m3u8(\?.*)?$", vurl, re.I):
-                return handle_hls_to_temp(vurl, max_seconds=8)
-            hh = head(vurl)
-            if hh and is_video_response(hh):
-                return download_to_temp(hh.url, suffix=guess_suffix_from_headers(hh))
-            if is_video_like_url(vurl):
-                return download_to_temp(vurl)
-    except Exception:
-        pass
-
-    # Plain extension fallback
-    if is_video_like_url(url):
-        return download_to_temp(url)
-
-    raise ValueError("Unable to resolve a direct video URL")
+def sample_hls_to_file(m3u8_url: str, seconds: int = HLS_SAMPLE_SECONDS) -> str:
+    # Estrae ~N secondi con ffmpeg, user-agent e timeout
+    import subprocess, tempfile
+    out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4"); out.close()
+    cmd = [
+        "ffmpeg",
+        "-user_agent", FFMPEG_USER_AGENT,
+        "-rw_timeout", str(FFMPEG_RW_TIMEOUT_US),
+        "-y",
+        "-i", m3u8_url,
+        "-t", str(seconds),
+        "-c", "copy",
+        out.name
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0 or not os.path.exists(out.name) or os.path.getsize(out.name) == 0:
+        try: os.unlink(out.name)
+        except Exception: pass
+        raise RuntimeError(f"ffmpeg HLS sample failed: {p.stderr[-400:]}")
+    return out.name
