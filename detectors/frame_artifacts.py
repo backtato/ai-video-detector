@@ -1,20 +1,24 @@
 import cv2, numpy as np
+
 def _hf(gray):
     lap = cv2.Laplacian(gray, cv2.CV_64F); var = float(lap.var())
     return np.tanh(var/1000.0)
+
 def _blk(gray):
     h,w = gray.shape
     v = gray[:,7::8].astype(np.float32) - gray[:,8::8].astype(np.float32) if w>16 else np.zeros((1,1),np.float32)
     hE= gray[7::8,:].astype(np.float32) - gray[8::8,:].astype(np.float32) if h>16 else np.zeros((1,1),np.float32)
     m = float(np.mean(np.abs(v))) + float(np.mean(np.abs(hE)))
     return np.tanh(m/20.0)
+
 def _noise(frames_gray):
     if len(frames_gray)<3: return 0.5
-    diffs=[]; import numpy as np
+    diffs=[]
     for i in range(1,len(frames_gray)):
         diffs.append(float(np.mean(np.abs(frames_gray[i].astype(np.float32)-frames_gray[i-1].astype(np.float32)))))
     v = np.var(diffs) if len(diffs)>1 else 0.0
     return 1.0 - np.tanh(v/50.0)
+
 def score_frame_artifacts(frames_bgr):
     if not frames_bgr: return {"score":0.6,"notes":["No frames"]}
     hf_vals=[]; blk_vals=[]; g=[]
