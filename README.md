@@ -1,26 +1,25 @@
 # AI Video Detector (Resolver) – Backend (EN)
 
-**What it does**
-- Analyzes video content to estimate if it is AI-generated (heuristic MVP).
-- Supports file uploads and direct URLs. For HLS `.m3u8`, it samples ~8s with `ffmpeg`.
+## Endpoints
+- `GET /` , `GET /healthz`
+- `POST /analyze` (file upload)
+- `POST /analyze-url` (direct media / HLS sample)
+- `POST /analyze-link` (**context-only**; MVP supports YouTube links)
 
-**Endpoints**
-- `GET /`          → service status
-- `GET /healthz`   → health check
-- `POST /analyze`  → multipart file upload
-- `POST /analyze-url` → `{ "url": "https://..." }` (direct video or resolvable HLS)
+## Response (content analysis)
+- `ai_plausibility` [0..1], `confidence` [0..1], `label`: "Likely AI" | "Likely Original" | "Inconclusive"
 
-**Response**
-- `ai_plausibility` [0..1]
-- `confidence` [0..1]
-- `label` → `Likely AI` | `Likely Original` | `Inconclusive`
-- `explanations`, `video_info`
+## Response (context analysis)
+- `context_only`: true
+- `platform`: "youtube"
+- `context_trust_score` [0..1]
+- `context_label`: "Context suggests authentic" | "Context suspicious" | "Context inconclusive"
+- `context_signals`: [ ... ]
+- `label`: "Not assessable (content unavailable)"  (content verdict unavailable; use screen capture or file upload for a pixel-based verdict)
 
-**Environment**
-- `RESOLVER_ALLOWLIST` → comma-separated allowlist (e.g., `yourdomain.com,cdn.example.com`)
-- `RESOLVER_MAX_BYTES` → max download size in bytes (default 50 MB)
+## Environment
+- `YOUTUBE_API_KEY` → required for `/analyze-link` (YouTube)
+- `RESOLVER_ALLOWLIST`, `RESOLVER_MAX_BYTES`
 
-**Deploy on Render**
-- Create a Web Service from this repo (Docker).
-- Set **Health Check Path** to `/healthz`.
-- Free tier may cold-start; consider a retry on the client (the provided WP plugin handles a single 502 retry).
+## Deploy
+Render Web Service (Docker). Set Health Check Path `/healthz`.
