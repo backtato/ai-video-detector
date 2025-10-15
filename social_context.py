@@ -1,103 +1,101 @@
-# social_context.py
-import os, re, requests, datetime as dt
-from urllib.parse import urlparse, parse_qs
+import re
+import requests
+from datetime import datetime, timezone
 
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
+def is_youtube_url(url: str) -> bool:
+    u = url.lower()
+    return ("youtube.com" in u) or ("youtu.be" in u)
 
-YT_VIDEO_RE = re.compile(r"(?:v=|/shorts/|/live/|/embed/|youtu\.be/)([A-Za-z0-9_\-]{6,})", re.I)
+def extract_youtube_id(url: str) -> str | None:
+    # ?v=ID
+    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url)
+    if m: return m.group(1)
+    # youtu.be/ID
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
+    if m: return m.group(1)
+    # youtube.com/shorts/ID
+    m = re.search(r"youtube\.com/shorts/([A-Za-z0-9_-]{11})", url)
+    if m: return m.group(1)
+    return None
 
-def is_youtube_url(url:str)->bool:
-    host = (urlparse(url).hostname or "").lower() if url else ""
-    return any(h in (host or "") for h in ["youtube.com","youtu.be"])
+def _years_since(iso_str: str) -> float:
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z","+00:00"))
+        return max(0.0, (datetime.now(timezone.utc)-dt).days/365.25)
+    except Exception:
+        return 0.0
 
-def extract_youtube_id(url:str)->str|None:
-    if not url: return None
-    q = parse_qs(urlparse(url).query).get("v", [])
-    if q: return q[0]
-    m = YT_VIDEO_RE.search(url)
-    return m.group(1) if m else None
-
-def yt_get(path:str, params:dict):
-    if not YOUTUBE_API_KEY:
-        raise RuntimeError("YouTube API key missing (set YOUTUBE_API_KEY)")
-    base = "https://www.googleapis.com/youtube/v3/"+path.lstrip("/")
-    p = dict(params or {})
-    p["key"] = YOUTUBE_API_KEY
-    r = requests.get(base, params=p, timeout=10)
-    r.raise_for_status()
-    return r.json()
-
-def youtube_context_score(video_id:str)->dict:
-    # 1) Video info
-    vi = yt_get("videos", {"part":"snippet,contentDetails,statistics,status","id":video_id})
+def youtube_context_score(video_id: str, api_key: str) -> dict:
+    """
+    Restituisce un dizionario:
+      - score: 0..100
+      - label: "Context suggests authentic" | "Context suspicious" | "Context inconclusive"
+      - signals: elenco segnali
+    """
+    # Video details
+    vresp = requests.get(
+        "https://www.googleapis.com/youtube/v3/videos",
+        params={"part":"snippet,contentDetails,statistics,status","id":video_id,"key":api_key},
+        timeout=10
+    )
+    vi = vresp.json()
     items = vi.get("items", [])
     if not items:
-        return {"score":0.3, "signals":["Video not found"], "platform":"youtube", "video_id":video_id}
+        return {"score": 50, "label":"Context inconclusive", "signals": ["Video not found or private"]}
+
     v = items[0]
-    snip = v.get("snippet", {}) or {}
-    stats = v.get("statistics", {}) or {}
-    status = v.get("status", {}) or {}
+    snip = v.get("snippet", {})
+    ch_id = snip.get("channelId")
+    title = (snip.get("title") or "").lower()
+    description = (snip.get("description") or "").lower()
 
-    channel_id = snip.get("channelId","")
-    title = (snip.get("title") or "").strip()
-    desc = (snip.get("description") or "").strip()
-    published = snip.get("publishedAt")
+    # Channel
+    subs = 0
+    ch_age_years = 0.0
+    if ch_id:
+        cresp = requests.get(
+            "https://www.googleapis.com/youtube/v3/channels",
+            params={"part":"snippet,statistics,status","id":ch_id,"key":api_key},
+            timeout=10
+        )
+        ch = cresp.json()
+        chi = ch.get("items") or []
+        if chi:
+            c = chi[0]
+            subs = int(c.get("statistics", {}).get("subscriberCount", 0) or 0)
+            ch_age_years = _years_since(c.get("snippet", {}).get("publishedAt",""))
 
-    # 2) Channel info
-    ci = yt_get("channels", {"part":"snippet,statistics,brandingSettings","id":channel_id})
-    citems = ci.get("items", [])
-    c = citems[0] if citems else {}
-    cs = c.get("statistics", {}) or {}
-    c_sn = c.get("snippet", {}) or {}
-
-    # Heuristics → score in [0..1]
-    score = 0.5
+    # Heuristics → score 0..100
+    score = 50
     signals = []
 
-    # Channel age & subs
-    c_published = c_sn.get("publishedAt")
-    if c_published:
-        try:
-            age_years = (dt.datetime.utcnow() - dt.datetime.fromisoformat(c_published.replace("Z","+00:00"))).days/365.25
-            if age_years >= 3: score += 0.1; signals.append("Old channel")
-            elif age_years < 0.2: score -= 0.1; signals.append("Very new channel")
-        except Exception:
-            pass
+    # audience
+    if subs > 1_000_000:
+        score += 10; signals.append("Large audience channel")
+    elif subs > 100_000:
+        score += 6; signals.append("Significant audience channel")
+    elif subs < 1_000:
+        score -= 5; signals.append("Very small audience")
 
-    subs = int(cs.get("subscriberCount","0") or 0)
-    if subs >= 100000: score += 0.08; signals.append("High subscriber count")
-    elif subs < 50: score -= 0.08; signals.append("Very low subscriber count")
+    # channel age
+    if ch_age_years >= 5:
+        score += 6; signals.append(f"Old channel (~{ch_age_years:.1f}y)")
+    elif ch_age_years < 0.5:
+        score -= 6; signals.append("Very new channel")
 
-    views = int(stats.get("viewCount","0") or 0)
-    likecount = int(stats.get("likeCount","0") or 0)
-    if views >= 100000 and likecount >= 1000: score += 0.05; signals.append("Healthy engagement")
-    if "made with ai" in (title+desc).lower() or "ai generated" in (title+desc).lower():
-        score += 0.02; signals.append("Self-declared AI mention")
+    # content cues
+    clickbait_terms = ["shocking", "you won't believe", "gone wrong", "impossible", "ai generated"]
+    if any(t in title for t in clickbait_terms):
+        score -= 5; signals.append("Clickbait-like title")
+    if " ai " in f" {title} " or " ai " in f" {description} ":
+        signals.append("Mentions AI in title/description")
 
-    # Title/desc sanity (over-claims / clickbait-y)
-    clickbait_terms = ["shocking","you won’t believe","leaked","impossible","100% real"]
-    if any(t in (title+desc).lower() for t in clickbait_terms):
-        score -= 0.05; signals.append("Clickbait phrasing")
-
-    # Monetization/embeddable/public
-    if status.get("embeddable", True): score += 0.01
-    if status.get("privacyStatus") != "public": score -= 0.05; signals.append("Not public")
-
-    # Clamp
-    score = max(0.0, min(1.0, score))
-
-    # Map to context label
-    if score >= 0.70:
-        ctx_label = "Context suggests authentic"
-    elif score < 0.40:
-        ctx_label = "Context suspicious"
+    score = max(0, min(100, score))
+    if score >= 65:
+        label = "Context suggests authentic"
+    elif score <= 35:
+        label = "Context suspicious"
     else:
-        ctx_label = "Context inconclusive"
+        label = "Context inconclusive"
 
-    return {
-        "score": round(score,4),
-        "signals": signals,
-        "platform": "youtube",
-        "video_id": video_id,
-        "context_label": ctx_label
-    }
+    return {"score": score, "label": label, "signals": signals}
