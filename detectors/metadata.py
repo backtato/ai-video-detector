@@ -31,3 +31,4 @@ def score_metadata(info):
     except Exception as e:
         notes.append(f"metadata parse error: {e}"); score=0.6
     return {"score": score, "notes": notes}
+
