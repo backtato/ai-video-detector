@@ -1,12 +1,12 @@
 fastapi==0.112.0
-uvicorn==0.30.6
+uvicorn[standard]==0.30.6
+gunicorn==21.2.0
 python-multipart==0.0.12
 pydantic==2.8.2
-opencv-python==4.10.0.84
+opencv-python-headless==4.10.0.84
 numpy==1.26.4
 scipy==1.11.4
 ffmpeg-python==0.2.0
 mutagen==1.47.0
 requests==2.32.3
 beautifulsoup4==4.12.3
-gunicorn>=21.2
