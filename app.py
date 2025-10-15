@@ -1,7 +1,6 @@
- import os
+import os
 import re
 import tempfile
-import requests
 from fastapi import FastAPI, UploadFile, File, Body
 from fastapi.responses import JSONResponse
 
@@ -20,7 +19,7 @@ from detectors.audio import score_audio
 from utils import extract_frames, video_duration_fps
 from resolver import resolve_to_tempfile
 
-# NEW: import context analyzer
+# Context analyzer (YouTube)
 from social_context import is_youtube_url, extract_youtube_id, youtube_context_score
 
 app = FastAPI(title="AI Video Plausibility Detector (Resolver)")
@@ -153,8 +152,23 @@ def analyze_link(payload: dict = Body(...)):
                  "label": "Not assessable (content unavailable)"},
                 status_code=400,
             )
-        ctx = youtube_context_score(vid, api_key=YOUTUBE_API_KEY)
-        # mapping coerente con il plugin WP
+        # robust error handling: no 500s on YouTube failures
+        try:
+            ctx = youtube_context_score(vid, api_key=YOUTUBE_API_KEY)
+        except ValueError as e:
+            # Clean error from YouTube API (quota/restrictions/non-JSON)
+            return JSONResponse(
+                {"error": str(e), "label": "Not assessable (content unavailable)", "platform": "youtube"},
+                status_code=502,  # external dependency error
+            )
+        except Exception as e:
+            # Any unexpected error still must not bubble as 500
+            return JSONResponse(
+                {"error": f"Unexpected context error: {e}",
+                 "label": "Not assessable (content unavailable)", "platform": "youtube"},
+                status_code=502,
+            )
+
         return JSONResponse({
             "label": "Not assessable (content unavailable)",
             "context_only": True,
@@ -165,6 +179,7 @@ def analyze_link(payload: dict = Body(...)):
             "source_url": url,
         })
 
+    # other platforms can be added (context-only) in future
     return JSONResponse(
         {"error": "Unsupported platform for analyze-link",
          "label": "Not assessable (content unavailable)"},
