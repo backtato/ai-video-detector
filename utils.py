@@ -9,6 +9,7 @@ def extract_frames(path, max_frames=64, stride=5):
             if len(frames)>=max_frames: break
         idx+=1
     cap.release(); return frames
+
 def video_duration_fps(path):
     cap=cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
