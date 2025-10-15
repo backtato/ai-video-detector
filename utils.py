@@ -1,4 +1,5 @@
 import cv2
+
 def extract_frames(path, max_frames=64, stride=5):
     cap=cv2.VideoCapture(path); frames=[]; idx=0
     while True:
