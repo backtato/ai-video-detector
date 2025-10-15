@@ -17,7 +17,6 @@ def _noise(frames_gray):
     return 1.0 - np.tanh(v/50.0)
 def score_frame_artifacts(frames_bgr):
     if not frames_bgr: return {"score":0.6,"notes":["No frames"]}
-    import cv2, numpy as np
     hf_vals=[]; blk_vals=[]; g=[]
     for f in frames_bgr:
         gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY); g.append(gray)
