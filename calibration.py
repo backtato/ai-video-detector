@@ -5,3 +5,4 @@ def combine_scores(weighted):
     num=0.0; den=0.0
     for _, (score,w) in weighted.items(): num += score*w; den += w
     return (num/den) if den>0 else 0.5
+
