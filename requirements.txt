@@ -1,7 +1,0 @@
-fastapi==0.115.4
-uvicorn==0.32.0
-gunicorn==23.0.0
-pydantic==2.9.2
-requests==2.32.3
-numpy==2.1.2
-opencv-python-headless==4.10.0.84
