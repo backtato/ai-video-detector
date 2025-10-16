@@ -1,15 +1,12 @@
 
 import os
-import re
-import uuid
 import shutil
-import tempfile
+import uuid
 import requests
 from urllib.parse import urlparse
 from typing import Optional, Tuple
 from app.config import settings
 
-# domini tipici social / video
 SOCIAL_DOMAINS = [
     "youtube.com", "youtu.be", "m.youtube.com",
     "tiktok.com", "vm.tiktok.com",
@@ -51,7 +48,6 @@ def _download_direct(url: str, dest_dir: str, size_limit_bytes: int) -> str:
     return out_path
 
 def _download_yt_dlp(url: str, dest_dir: str, size_limit_bytes: int) -> str:
-    # usiamo yt-dlp con format preferendo <= 360p o <=50MB
     from yt_dlp import YoutubeDL
     out_path = os.path.join(dest_dir, f"dl-{uuid.uuid4().hex}.%(ext)s")
     ydl_opts = {
@@ -59,20 +55,17 @@ def _download_yt_dlp(url: str, dest_dir: str, size_limit_bytes: int) -> str:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        # prova vari formati leggeri prima
         "format": "best[height<=360][filesize<=50M]/best[height<=360]/best[filesize<=50M]/worst",
     }
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         real_path = ydl.prepare_filename(info)
-    # enforce size limit (post-download check)
     if os.path.getsize(real_path) > size_limit_bytes:
         try:
             os.remove(real_path)
         except Exception:
             pass
         raise ValueError("Il video scaricato supera il limite di 50MB. Prova un link più corto o qualità più bassa.")
-    # rinomina con estensione sicura se non in whitelist
     ext = _safe_ext(real_path)
     if not real_path.lower().endswith(ext):
         new_path = os.path.splitext(real_path)[0] + ext
@@ -81,7 +74,6 @@ def _download_yt_dlp(url: str, dest_dir: str, size_limit_bytes: int) -> str:
     return real_path
 
 def download_video(url: str, dest_dir: Optional[str] = None, max_mb: int = 50) -> Tuple[str, str]:
-    """Ritorna (path_locale, sorgente) dove sorgente è 'direct' o 'yt-dlp'."""
     if not dest_dir:
         dest_dir = settings.TMP_DIR
     os.makedirs(dest_dir, exist_ok=True)
