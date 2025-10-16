@@ -1,4 +1,3 @@
-
 import cv2 as cv
 import numpy as np
 from typing import Tuple, List
@@ -12,7 +11,7 @@ def read_video_frames(path: str, target_fps: int = 6, max_frames: int = 480) -> 
     width = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
 
-    step = max(int(round(src_fps / max(target_fps,1))), 1)
+    step = max(int(round(src_fps / max(target_fps, 1))), 1)
     frames = []
     i = 0
     kept = 0
@@ -24,9 +23,10 @@ def read_video_frames(path: str, target_fps: int = 6, max_frames: int = 480) -> 
             ret, frame = cap.retrieve()
             if not ret:
                 break
+            # ridimensiona se troppo grande per non consumare memoria/CPU
             if max(height, width) > 1080:
                 r = 1080 / max(height, width)
-                new_w, new_h = int(width*r), int(height*r)
+                new_w, new_h = int(width * r), int(height * r)
                 frame = cv.resize(frame, (new_w, new_h), interpolation=cv.INTER_AREA)
             frames.append(frame)
             kept += 1
