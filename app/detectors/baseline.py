@@ -1,4 +1,3 @@
-
 import numpy as np
 import cv2 as cv
 from typing import List, Tuple, Dict
@@ -16,7 +15,7 @@ def flow_temporal_incoherence(prev, curr):
     flow = cv.calcOpticalFlowFarneback(prev, curr, None,
                                        pyr_scale=0.5, levels=3, winsize=15,
                                        iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
-    mag, ang = cv.cartToPolar(flow[...,0], flow[...,1])
+    mag, _ = cv.cartToPolar(flow[..., 0], flow[..., 1])
     return float(np.std(mag))
 
 class BaselineDetector:
@@ -35,7 +34,6 @@ class BaselineDetector:
         for i in range(1, len(grays)):
             flows.append(flow_temporal_incoherence(grays[i-1], grays[i]))
 
-        import numpy as np
         blur_med = float(np.median(blurs)) if blurs else 0.0
         blur_iqr = float(np.percentile(blurs, 75) - np.percentile(blurs, 25)) if blurs else 0.0
         block_mean = float(np.mean(blocks)) if blocks else 0.0
@@ -50,6 +48,7 @@ class BaselineDetector:
 
         raw = 0.35 * b + 0.4 * k + 0.25 * t + 0.25 * low_texture_penalty
         score = float(1 / (1 + np.exp(-(raw - 1.2))))
+
         details = {
             "frames": len(frames),
             "fps_inferred": fps,
