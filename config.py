@@ -1,45 +1,38 @@
 import os
 
-# ====== Thresholds & calibration ======
+# ----- General -----
+APP_NAME = "AI-Video"
+APP_VERSION = os.getenv("APP_VERSION", "0.5.0")
+ENV = os.getenv("ENV", "production")
+
+# Bytes
+MB = 1024 * 1024
+
+# Limits (aligned to project memory)
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 80 * MB))           # 80 MB
+RESOLVER_MAX_BYTES = int(os.getenv("RESOLVER_MAX_BYTES", 120 * MB))      # 120 MB
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", 25))                # seconds
+
+# Analysis thresholds
+MIN_DURATION_SEC = float(os.getenv("MIN_DURATION_SEC", 4.0))
+MIN_FRAMES_FOR_CONFIDENCE = int(os.getenv("MIN_FRAMES_FOR_CONFIDENCE", 64))
+
+# Decision thresholds (tunable)
+THRESH_AI = float(os.getenv("THRESH_AI", 0.66))
+THRESH_ORIGINAL = float(os.getenv("THRESH_ORIGINAL", 0.34))
+
+# Ensemble weights (sum ~= 1)
 ENSEMBLE_WEIGHTS = {
-    "metadata": 0.35,
-    "frame_artifacts": 0.45,
-    "audio": 0.20,   # NB: feature semplice; valuta di abbassarla se “piatta”
-}
-CALIBRATION = {
-    "logit_a": 1.0,
-    "logit_b": 0.0,
+    "metadata": float(os.getenv("W_METADATA", 0.33)),
+    "frame_artifacts": float(os.getenv("W_FRAME", 0.44)),
+    "audio": float(os.getenv("W_AUDIO", 0.23)),
 }
 
-# ====== Confidence policy ======
-MIN_FRAMES_FOR_CONFIDENCE = 60
-MIN_DURATION_SEC = 4.0
+# Calibration toggle (if set to "1", apply isotonic-like squashing)
+CALIBRATION = bool(int(os.getenv("CALIBRATION", "1")))
 
-# Durata-consapevole: offset e pendenza più prudenti su clip brevi
-CONFIDENCE_BASE = 0.2         # prima era 0.3
-CONFIDENCE_SCALE = 0.8        # prima era 0.7
-CONFIDENCE_MAX_FRAMES = 180   # frames per arrivare a conf. piena
-CONFIDENCE_MAX_DURATION = 120 # sec per arrivare a conf. piena
-
-THRESH_AI = 0.60
-THRESH_ORIGINAL = 0.40
-
-# ====== Resolver / networking ======
-# Se vuoto: consenti http/https pubblici (blocca IP privati/localhost)
-RESOLVER_ALLOWLIST = os.getenv("RESOLVER_ALLOWLIST", "")
-# Cap byte per download da URL (413 se oltre)
-RESOLVER_MAX_BYTES = int(os.getenv("RESOLVER_MAX_BYTES", str(120 * 1024 * 1024)))  # 120MB
-# Cap byte per upload locale (413 se oltre)
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(80 * 1024 * 1024)))       # 80MB
-
-# ffmpeg HLS options
-FFMPEG_USER_AGENT = os.getenv("FFMPEG_USER_AGENT", "Mozilla/5.0 (AI-Video/1.0)")
-FFMPEG_RW_TIMEOUT_US = int(os.getenv("FFMPEG_RW_TIMEOUT_US", "15000000"))  # 15s
-HLS_SAMPLE_SECONDS = int(os.getenv("HLS_SAMPLE_SECONDS", "8"))
-
-# ====== Sampling policy ======
-# su video lunghi, limitiamo il numero di frame estratti
-MAX_SAMPLED_FRAMES = int(os.getenv("MAX_SAMPLED_FRAMES", "180"))
-
-# ====== YouTube / social ======
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+# User Agent for resolver
+DEFAULT_UA = os.getenv(
+    "RESOLVER_UA",
+    "AI-Video/0.5 (+https://ai-video.org; contact: admin@ai-video.org)"
+)

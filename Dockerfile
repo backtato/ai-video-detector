@@ -1,19 +1,20 @@
 FROM python:3.11-slim
 
-# Dipendenze di sistema minime (ffmpeg per HLS e probing)
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-  && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy
+COPY backend/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY . .
+COPY backend /app/backend
 
-# Porta di default usata dall'app
+ENV PYTHONUNBUFFERED=1
+ENV PORT=8000
+
 EXPOSE 8000
-
-# Avvio robusto in prod
-CMD ["gunicorn","-k","uvicorn.workers.UvicornWorker","app:app","--bind","0.0.0.0:8000","--workers","2","--threads","4","--timeout","180","--graceful-timeout","30"]
+CMD ["gunicorn", "-c", "backend/gunicorn_conf.py", "backend.app:app"]
