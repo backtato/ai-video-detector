@@ -1,4 +1,3 @@
-
 import os
 import shutil
 import uuid
@@ -55,6 +54,7 @@ def _download_yt_dlp(url: str, dest_dir: str, size_limit_bytes: int) -> str:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        # cerca di rimanere <= 50MB e bassa risoluzione per velocità/costi
         "format": "best[height<=360][filesize<=50M]/best[height<=360]/best[filesize<=50M]/worst",
     }
     with YoutubeDL(ydl_opts) as ydl:
