@@ -1,0 +1,27 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Virtualenv / environment
+.env
+.venv/
+.vscode/
+
+# Git
+.git/
+.gitignore
+
+# Tests and temporary
+tests/
+tmp/
+
+# Video sample files
+*.mp4
+*.mov
+*.mkv
+*.webm
