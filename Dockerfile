@@ -1,20 +1,24 @@
 FROM python:3.11-slim
 
-# System deps
+# Dipendenze di sistema
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy
-COPY backend/requirements.txt /app/requirements.txt
+# Reqs dalla root del repo
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY backend /app/backend
+# Copia tutto il codice (root → /app)
+COPY . /app
 
+# Env
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 
 EXPOSE 8000
-CMD ["gunicorn", "-c", "backend/gunicorn_conf.py", "backend.app:app"]
+
+# Avvio (app.py è in root e l'istanza FastAPI si chiama "app")
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "1", "-b", "0.0.0.0:8000", "app:app"]
