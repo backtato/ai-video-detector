@@ -1,0 +1,19 @@
+
+services:
+  - type: web
+    name: ai-video-detector
+    env: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: TARGET_FPS
+        value: "6"
+      - key: MAX_FRAMES
+        value: "480"
+      - key: THRESHOLD
+        value: "0.55"
+      - key: GUNICORN_TIMEOUT
+        value: "180"
+      - key: MAX_UPLOAD_MB
+        value: "50"
