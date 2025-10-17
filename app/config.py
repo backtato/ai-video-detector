@@ -1,14 +1,23 @@
+# config.py
+from typing import Optional
 import os
-from dataclasses import dataclass
 
-@dataclass
-class Settings:
-    TARGET_FPS: int = int(os.environ.get("TARGET_FPS", "6"))
-    MAX_FRAMES: int = int(os.environ.get("MAX_FRAMES", "480"))
-    THRESHOLD: float = float(os.environ.get("THRESHOLD", "0.55"))
-    MIN_EDGE_VAR: float = float(os.environ.get("MIN_EDGE_VAR", "15.0"))
-    TMP_DIR: str = os.environ.get("TMP_DIR", "/tmp/vids")
-    MAX_UPLOAD_MB: int = int(os.environ.get("MAX_UPLOAD_MB", "50"))
-    ALLOWED_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi")
+# Limiti & timeouts
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 50 * 1024 * 1024))   # 50 MB
+RESOLVER_MAX_BYTES = int(os.getenv("RESOLVER_MAX_BYTES", 80 * 1024 * 1024))
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", 45))                  # sec
+FFMPEG_TRIM_SECONDS = int(os.getenv("FFMPEG_TRIM_SECONDS", 20))            # primi 20s
 
-settings = Settings()
+# CORS
+CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
+
+# Soglie/parametri (MVP dimostrativo)
+ENSEMBLE_WEIGHTS = {"metadata": 0.34, "frame_artifacts": 0.33, "audio": 0.33}
+CALIBRATION = {"bias": 0.0, "scale": 1.0}
+MIN_FRAMES_FOR_CONFIDENCE = 12
+MIN_DURATION_SEC = 3.0
+THRESH_AI = 0.65
+THRESH_ORIGINAL = 0.35
+
+# Path tmp
+TMP_DIR = os.getenv("TMP_DIR", "/tmp")
