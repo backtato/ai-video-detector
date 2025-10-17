@@ -1,32 +1,26 @@
+# CPU-only, Python 3.11 slim
 FROM python:3.11-slim
 
-# Evita bytecode e output bufferizzato
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PYTHONUNBUFFERED=1
 
-# Dipendenze di sistema (ffmpeg include ffprobe)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg curl ca-certificates && \
+# System deps: ffmpeg/ffprobe per yt-dlp e analisi media
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
+# Crea dir app
 WORKDIR /app
 
-# Installa deps Python con cache layer-friendly
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install requirements con caching corretto
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copia il codice
+# Copia il resto del codice
 COPY . /app
 
-# Porta dinamica di Render
-ENV PORT=8000
-
+# Healthcheck (opzionale; Render usa /healthz)
 EXPOSE 8000
-# Avvio robusto con UvicornWorker e timeout ragionevoli
-CMD gunicorn -k uvicorn.workers.UvicornWorker app:app \
-    --bind 0.0.0.0:${PORT} \
-    --timeout 120 \
-    --graceful-timeout 30 \
-    --workers 1 \
-    --threads 4
+
+# Gunicorn + UvicornWorker (config in gunicorn_conf.py)
+CMD ["gunicorn", "-c", "gunicorn_conf.py", "app:app"]
