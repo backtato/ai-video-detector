@@ -1,7 +1,12 @@
-fastapi==0.115.2
-uvicorn[standard]==0.30.6
-gunicorn==23.0.0
-python-multipart==0.0.9
+fastapi==0.115.0
+uvicorn==0.30.6
+gunicorn==22.0.0
+starlette==0.38.5
 pydantic==2.9.2
-requests==2.32.3
-aiohttp==3.10.5
+# media / cv
+opencv-python-headless==4.10.0.84
+numpy==2.1.2
+# resolver URL social/YouTube (pin ragionevole)
+yt-dlp==2025.01.08
+# utili
+aiofiles==24.1.0
