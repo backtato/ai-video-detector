@@ -1,19 +1,45 @@
-import os, re, json, shlex, asyncio, subprocess, tempfile
+import os
+import io
+import shutil
+import tempfile
+import traceback
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import requests
 
-APP_NAME = "ai-video-detector"
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "50000000"))  # 50MB
-RESOLVER_ALLOWLIST = os.getenv("RESOLVER_ALLOWLIST", "youtube.com,vimeo.com,cdn,mp4,m3u8")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")  # opzionale: es. https://tuo-dominio
+# --- Config da ENV (con default sensati) ---
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))  # 50MB
+RESOLVER_MAX_BYTES = int(os.getenv("RESOLVER_MAX_BYTES", str(120 * 1024 * 1024)))
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+REQUEST_TIMEOUT_S = int(os.getenv("REQUEST_TIMEOUT_S", "120"))
 
-app = FastAPI(title=APP_NAME)
+# --- Importa pipeline esistente ---
+from calibration import calibrate, combine_scores  # noqa: E402
 
-allow_origins = [o for o in [FRONTEND_ORIGIN] if o] or ["*"]  # sblocca subito; restringi appena hai il dominio
+# Detectors (mantieni questi import coerenti con la tua repo)
+from app.detectors.metadata import ffprobe, score_metadata  # noqa: E402
+from app.detectors.frame_artifacts import score_frame_artifacts  # noqa: E402
+try:
+    from app.detectors.audio import score_audio  # opzionale se presente
+except Exception:
+    def score_audio(video_path: str) -> float:
+        return 0.45  # placeholder robusto se modulo non presente
+
+# yt-dlp per risolvere link social/YouTube
+try:
+    import yt_dlp  # type: ignore
+except Exception:  # difensivo: se non presente, lo segnaliamo a runtime
+    yt_dlp = None
+
+app = FastAPI(title="AI Video Detector")
+
+# --- CORS ---
+if ALLOWED_ORIGINS == "*":
+    allow_origins = ["*"]
+else:
+    allow_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
@@ -22,210 +48,230 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Schemi ----------
-class URLIn(BaseModel):
-    url: str
+# -------- Helpers ------------------------------------------------------------
 
-def _verdict_from_probe(probe_json: dict) -> dict:
+def _file_like_size(f: UploadFile) -> int:
+    # FastAPI non dà size diretta; proviamo a leggere in RAM solo per validazione piccola
+    # ma qui usiamo streaming-to-temp direttamente.
+    return -1
+
+def _save_upload_to_temp(upload: UploadFile) -> str:
+    # Salva lo stream in un file temporaneo evitando OOM
+    suffix = os.path.splitext(upload.filename or "")[-1] or ".bin"
+    fd, temp_path = tempfile.mkstemp(suffix=suffix)
+    total = 0
+    with os.fdopen(fd, "wb") as out:
+        while True:
+            chunk = upload.file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                out.close()
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+                raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_BYTES} bytes)")
+            out.write(chunk)
+    return temp_path
+
+def _download_url_to_temp(url: str) -> str:
     """
-    Heuristica placeholder: restituisce un JSON coerente con {label, ai_plausibility, confidence}
-    Puoi sostituire qui con la tua logica/ML.
+    Scarica una traccia “riproducibile” da un URL social/YouTube usando yt-dlp.
+    Scrive un MP4 temporaneo limitando dimensione/tempo per evitare abusi.
     """
-    # euristica delicata e “safe”: se ffprobe vede almeno 1 stream video valido => "Inconclusive"
-    streams = probe_json.get("streams") or []
-    has_video = any(s.get("codec_type") == "video" for s in streams)
-    if not has_video:
-        return {"label": "Inconclusive", "ai_plausibility": 0.5, "confidence": 0.4}
-    # banalissima metrica: bitrate o fps strani => più sospetto
-    fps = 0.0
-    for s in streams:
-        if s.get("codec_type") == "video" and s.get("avg_frame_rate") and s["avg_frame_rate"] != "0/0":
+    if not yt_dlp:
+        raise HTTPException(status_code=500, detail="yt-dlp non installato nel server")
+
+    # tmp dir per l’output
+    tmp_dir = tempfile.mkdtemp(prefix="aivideo_")
+    outtmpl = os.path.join(tmp_dir, "download.%(ext)s")
+
+    ydl_opts = {
+        # formato conservativo che produce un container semplice
+        "format": "mp4/bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
+        "outtmpl": outtmpl,
+        "retries": 2,
+        "fragment_retries": 2,
+        "ignoreerrors": True,
+        "noprogress": True,
+        "nocheckcertificate": True,
+        "quiet": True,
+        "no_warnings": True,
+        # Evita segmenti parziali su FS
+        "nopart": True,
+        # User-Agent “realistico”
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0 Safari/537.36"
+        },
+        # Impone timeouts ragionevoli
+        "socket_timeout": 20,
+        # Post-processor merge audio/video
+        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+        # Rate limit leggero per non saturare
+        "ratelimit": 2_000_000,  # ~2 MB/s
+    }
+
+    # Esegue il download
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                raise HTTPException(status_code=422, detail="Impossibile risolvere l’URL (no info)")
+            # Ricava path effettivo
+            if "requested_downloads" in info and info["requested_downloads"]:
+                filepath = info["requested_downloads"][0]["filepath"]
+            else:
+                # fallback: derive from outtmpl and extension
+                ext = info.get("ext") or "mp4"
+                filepath = outtmpl.replace("%(ext)s", ext)
+
+            if not os.path.exists(filepath):
+                raise HTTPException(status_code=422, detail="Download fallito (file mancante)")
+
+            # Controllo dimensione
+            size = os.path.getsize(filepath)
+            if size > RESOLVER_MAX_BYTES:
+                # pulizia e errore
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                finally:
+                    pass
+                raise HTTPException(status_code=413, detail="Il video scaricato supera il limite server")
+
+            return filepath
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=422, detail=f"Risoluzione URL fallita: {str(e) or 'errore generico'}")
+
+def _analyze_video(video_path: str) -> dict:
+    """
+    Pipeline: ffprobe -> detectors -> ensemble -> response schema stabile.
+    I detectors sono quelli già presenti nella repo.
+    """
+    meta = ffprobe(video_path)
+    # Punteggi (0..1)
+    s_meta = score_metadata(meta)
+    s_frame = score_frame_artifacts(video_path)
+    s_audio = score_audio(video_path)
+
+    # Combina punteggi con calibrazione/ensemble (interno progetto)
+    combined, details = combine_scores({
+        "metadata": s_meta,
+        "frame_artifacts": s_frame,
+        "audio": s_audio,
+    })
+    # Calibrazione finale (se definita)
+    ai_score, confidence = calibrate(combined)
+
+    # Arricchisci con info utili se disponibili da ffprobe
+    duration = meta.get("duration_s")
+    fps = meta.get("fps")
+    frames = meta.get("frames")
+
+    return {
+        "ai_score": round(float(ai_score), 4),
+        "confidence": round(float(confidence), 4),
+        "details": {
+            "metadata": details.get("metadata", s_meta),
+            "frame_artifacts": details.get("frame_artifacts", s_frame),
+            "audio": details.get("audio", s_audio),
+        },
+        "duration_s": duration,
+        "fps": fps,
+        "frames": frames,
+    }
+
+# -------- Routes -------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    return """<!doctype html>
+<html lang="it"><head><meta charset="utf-8">
+<title>AI Video Detector</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head><body style="font-family: system-ui, sans-serif; padding:24px">
+<h1>AI Video Detector</h1>
+<p>Inserisci un link (YouTube/social) oppure carica un file (max 50MB).</p>
+<form method="post" action="/predict" enctype="multipart/form-data">
+  <div>
+    <label>URL (YouTube/TikTok/X/Instagram/Facebook/Reddit)</label><br>
+    <input type="url" name="url" placeholder="https://..." style="width:420px">
+  </div>
+  <p><em>— oppure —</em></p>
+  <div>
+    <label>File video</label><br>
+    <input type="file" name="file">
+  </div>
+  <p><button type="submit">Analizza</button></p>
+</form>
+<p style="opacity:.7">Endpoint GET rapidi: <code>/predict-get?url=...</code> oppure <code>/predict?url=...</code></p>
+</body></html>"""
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz() -> str:
+    return "ok"
+
+# --- Alias GET per test rapidi (già documentati in README) ---
+@app.get("/predict-get")
+@app.get("/predict")
+def predict_get(url: Optional[str] = None):
+    if not url:
+        raise HTTPException(status_code=400, detail="Parametro 'url' mancante")
+    path = _download_url_to_temp(url)
+    try:
+        result = _analyze_video(path)
+        return JSONResponse(result)
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+# --- Endpoint POST principale (contratto unico stabile) ---
+@app.post("/predict")
+async def predict(url: Optional[str] = Form(None), file: Optional[UploadFile] = File(None)):
+    if not url and not file:
+        raise HTTPException(status_code=400, detail="Fornisci 'url' oppure 'file'")
+
+    temp_path = None
+    try:
+        if url:
+            temp_path = _download_url_to_temp(url)
+        else:
+            # Upload di file: salva stream in /tmp con limite dimensione
+            if not file:
+                raise HTTPException(status_code=400, detail="File mancante")
+            temp_path = _save_upload_to_temp(file)
+
+        result = _analyze_video(temp_path)
+        return JSONResponse(result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Errore interno: {str(e) or 'analisi fallita'}")
+    finally:
+        if temp_path and os.path.exists(temp_path):
             try:
-                num, den = s["avg_frame_rate"].split("/")
-                fps = float(num) / float(den)
+                os.remove(temp_path)
             except Exception:
                 pass
-    if fps and (fps > 70 or fps < 12):
-        return {"label": "AI-likely", "ai_plausibility": 0.72, "confidence": 0.6}
-    return {"label": "Inconclusive", "ai_plausibility": 0.48, "confidence": 0.45}
 
-async def _run_ffprobe(input_path_or_url: str, timeout: int = 25) -> dict:
-    """
-    Esegue ffprobe in JSON; supporta URL http(s) e file locali.
-    """
-    cmd = f'ffprobe -v error -print_format json -show_streams -show_format {shlex.quote(input_path_or_url)}'
-    proc = await asyncio.create_subprocess_shell(
-        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        raise HTTPException(status_code=408, detail="ffprobe timeout")
-    if proc.returncode != 0:
-        # Errore “classico” se URL non diretto o container senza permessi protocolli
-        raise HTTPException(status_code=422, detail=f"ffprobe failed: {err.decode('utf-8', 'ignore')[:300]}")
-    try:
-        return json.loads(out.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=500, detail="Invalid ffprobe JSON")
-
-def _looks_direct_media(url: str) -> bool:
-    return bool(re.search(r'\.(mp4|mov|webm|mkv|m3u8)(\?|$)', url, re.I))
-
-# ---------- Endpoints ----------
-@app.get("/")
-def ping():
-    return {"name": APP_NAME, "status": "ok"}
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
-
+# --- ALIAS per compatibilità con il plugin WP (evita 404) ---
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
-    # size guard (se conosci content_length via client, altrimenti scriviamo su tmp e verifichiamo)
-    data = await file.read()
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_BYTES} bytes)")
-    with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename)[-1] or ".bin", delete=True) as tmp:
-        tmp.write(data)
-        tmp.flush()
-        probe = await _run_ffprobe(tmp.name)
-    verdict = _verdict_from_probe(probe)
-    return {
-        "ok": True,
-        "input": {"filename": file.filename, "bytes": len(data)},
-        "probe": {"format": probe.get("format", {}), "streams": probe.get("streams", [])[:2]},  # riduci risposta
-        **verdict,
-    }
+async def analyze_legacy(url: Optional[str] = Form(None), file: Optional[UploadFile] = File(None)):
+    # Rimanda alla stessa logica di /predict
+    return await predict(url=url, file=file)
 
 @app.post("/analyze-url")
-async def analyze_url(body: URLIn):
-    url = body.url.strip()
+async def analyze_url_legacy(url: Optional[str] = Form(None)):
     if not url:
-        raise HTTPException(status_code=400, detail="url required")
-    if not _looks_direct_media(url):
-        # non provare ffprobe: chiarisci subito l’errore
-        raise HTTPException(status_code=400, detail="Not a direct media URL (.mp4/.m3u8 etc.). Use /analyze-link.")
-    # opzionale: HEAD per dimensione
-    try:
-        head = requests.head(url, timeout=8, allow_redirects=True)
-        cl = int(head.headers.get("content-length", "0") or "0")
-        if cl and cl > MAX_UPLOAD_BYTES:
-            # consentiamo comunque: è URL, non upload — ma informiamo
-            pass
-    except Exception:
-        pass
-    probe = await _run_ffprobe(url)
-    verdict = _verdict_from_probe(probe)
-    return {
-        "ok": True,
-        "input": {"url": url},
-        "probe": {"format": probe.get("format", {}), "streams": probe.get("streams", [])[:2]},
-        **verdict,
-    }
-
-@app.post("/analyze-link")
-def analyze_link(body: URLIn):
-    url = body.url.strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="url required")
-    # Per link tipo YouTube, restituiamo analisi “context-only” se non possiamo scaricare
-    info = {"provider": None, "id": None, "title": None}
-    if "youtube.com" in url or "youtu.be" in url:
-        info["provider"] = "youtube"
-        m = re.search(r'(?:v=|/)([A-Za-z0-9_-]{6,})', url)
-        if m:
-            info["id"] = m.group(1)
-        if not YOUTUBE_API_KEY:
-            return {
-                "ok": True,
-                "context_only": True,
-                "message": "Provide YOUTUBE_API_KEY to enrich metadata; media not downloaded.",
-                "input": {"url": url},
-                "info": info,
-                "label": "Inconclusive",
-                "ai_plausibility": 0.5,
-                "confidence": 0.3
-            }
-        # opzionale: chiamata YouTube Data API v3 (solo metadati)
-        try:
-            r = requests.get(
-                "https://www.googleapis.com/youtube/v3/videos",
-                params={"id": info["id"], "key": YOUTUBE_API_KEY, "part": "snippet,contentDetails"},
-                timeout=8
-            )
-            if r.ok:
-                data = r.json()
-                if data.get("items"):
-                    info["title"] = data["items"][0]["snippet"]["title"]
-        except Exception:
-            pass
-        return {
-            "ok": True,
-            "context_only": True,
-            "message": "Metadata fetched; media not downloaded.",
-            "input": {"url": url},
-            "info": info,
-            "label": "Inconclusive",
-            "ai_plausibility": 0.5,
-            "confidence": 0.35
-        }
-    # Altri provider → solo contesto
-    return {
-        "ok": True, "context_only": True, "message": "Generic link; media not downloaded.",
-        "input": {"url": url},
-        "label": "Inconclusive", "ai_plausibility": 0.5, "confidence": 0.3
-    }
-
-# ---------- Alias retro-compatibile /predict ----------
-# Accetta EITHER: file=@... (multipart) OR url=... (form/json). Manteniamo la semantica storica.
-@app.post("/predict")
-async def predict(
-    file: Optional[UploadFile] = File(None),
-    url: Optional[str] = Form(None)
-):
-    # Se arriva anche JSON {"url": "..."} lo intercettiamo via Form(None) == None -> allora proviamo a leggere da body JSON.
-    if url is None:
-        # prova a leggere JSON (alcuni client inviano application/json su /predict)
-        try:
-            # piccolo trucco: FastAPI non passa qui automaticamente il body,
-            # ma molti client reali usano form-data. Manteniamo il path "happy".
-            url = ""  # se serve solo form-data, questa parte verrà ignorata
-        except Exception:
-            url = None
-
-    if file is None and not url:
-        raise HTTPException(status_code=400, detail="Provide either file or url")
-
-    if file is not None:
-        data = await file.read()
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_BYTES} bytes)")
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or "")[-1] or ".bin", delete=True) as tmp:
-            tmp.write(data); tmp.flush()
-            probe = await _run_ffprobe(tmp.name)
-        verdict = _verdict_from_probe(probe)
-        return {
-            "ok": True,
-            "input": {"filename": file.filename, "bytes": len(data)},
-            "probe": {"format": probe.get("format", {}), "streams": (probe.get("streams") or [])[:2]},
-            **verdict,
-        }
-
-    # caso URL
-    url = (url or "").strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="url empty")
-    if not _looks_direct_media(url):
-        # Comportamento storico: molti client passavano link non diretti; forniamo messaggio chiaro
-        raise HTTPException(status_code=400, detail="URL is not direct media (.mp4/.m3u8). Use /analyze-link.")
-    probe = await _run_ffprobe(url)
-    verdict = _verdict_from_probe(probe)
-    return {
-        "ok": True,
-        "input": {"url": url},
-        "probe": {"format": probe.get("format", {}), "streams": (probe.get("streams") or [])[:2]},
-        **verdict,
-    }
+        raise HTTPException(status_code=400, detail="Parametro 'url' mancante")
+    return await predict(url=url, file=None)
