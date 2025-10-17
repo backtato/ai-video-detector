@@ -20,4 +20,5 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
 COPY . /app
 
 EXPOSE 8000
-CMD ["gunicorn", "-c", "gunicorn_conf.py", "app:app"]
+CMD ["gunicorn", "-c", "gunicorn_conf.py"]
+
