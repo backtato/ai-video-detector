@@ -7,7 +7,10 @@ pydantic==2.9.2
 opencv-python-headless==4.10.0.84
 numpy==2.1.2
 
-# yt-dlp senza pin "di calendario" (evita No matching distribution found)
+# Necessario per File(...) e Form(...) in FastAPI
+python-multipart==0.0.9
+
+# Resolver
 yt-dlp
 
 aiofiles==24.1.0
