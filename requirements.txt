@@ -3,10 +3,8 @@ uvicorn==0.30.6
 gunicorn==22.0.0
 starlette==0.38.5
 pydantic==2.9.2
-# media / cv
 opencv-python-headless==4.10.0.84
 numpy==2.1.2
-# resolver URL social/YouTube (pin ragionevole)
-yt-dlp==2025.01.08
-# utili
+# Usa una versione reale pubblicata su PyPI (stabile)
+yt-dlp==2025.10.14
 aiofiles==24.1.0
