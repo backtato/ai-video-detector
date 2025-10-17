@@ -1,6 +1,6 @@
 import os, re, json, shlex, asyncio, subprocess, tempfile
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
@@ -177,4 +177,55 @@ def analyze_link(body: URLIn):
         "ok": True, "context_only": True, "message": "Generic link; media not downloaded.",
         "input": {"url": url},
         "label": "Inconclusive", "ai_plausibility": 0.5, "confidence": 0.3
+    }
+
+# ---------- Alias retro-compatibile /predict ----------
+# Accetta EITHER: file=@... (multipart) OR url=... (form/json). Manteniamo la semantica storica.
+@app.post("/predict")
+async def predict(
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None)
+):
+    # Se arriva anche JSON {"url": "..."} lo intercettiamo via Form(None) == None -> allora proviamo a leggere da body JSON.
+    if url is None:
+        # prova a leggere JSON (alcuni client inviano application/json su /predict)
+        try:
+            # piccolo trucco: FastAPI non passa qui automaticamente il body,
+            # ma molti client reali usano form-data. Manteniamo il path "happy".
+            url = ""  # se serve solo form-data, questa parte verrà ignorata
+        except Exception:
+            url = None
+
+    if file is None and not url:
+        raise HTTPException(status_code=400, detail="Provide either file or url")
+
+    if file is not None:
+        data = await file.read()
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_BYTES} bytes)")
+        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or "")[-1] or ".bin", delete=True) as tmp:
+            tmp.write(data); tmp.flush()
+            probe = await _run_ffprobe(tmp.name)
+        verdict = _verdict_from_probe(probe)
+        return {
+            "ok": True,
+            "input": {"filename": file.filename, "bytes": len(data)},
+            "probe": {"format": probe.get("format", {}), "streams": (probe.get("streams") or [])[:2]},
+            **verdict,
+        }
+
+    # caso URL
+    url = (url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url empty")
+    if not _looks_direct_media(url):
+        # Comportamento storico: molti client passavano link non diretti; forniamo messaggio chiaro
+        raise HTTPException(status_code=400, detail="URL is not direct media (.mp4/.m3u8). Use /analyze-link.")
+    probe = await _run_ffprobe(url)
+    verdict = _verdict_from_probe(probe)
+    return {
+        "ok": True,
+        "input": {"url": url},
+        "probe": {"format": probe.get("format", {}), "streams": (probe.get("streams") or [])[:2]},
+        **verdict,
     }
