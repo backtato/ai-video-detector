@@ -1,15 +1,41 @@
+# VCS / IDE
+.git
+.gitignore
+.gitattributes
+.github
+.idea
+.vscode
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.sqlite3
-*.log
-.env
+*.swp
+*.swo
+*.DS_Store
+
+# Python venv
 .venv
-.vscode/
-.git/
-.gitignore
-tests/
-tmp/
+env
+venv
+ENV
+
+# Build / dist / cache
 build/
 dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.cache/
+
+# Dati locali e temporanei
+*.log
+tmp/
+temp/
+*.mp4
+*.webm
+*.mkv
+*.mov
+*.bin
+
+# Node (se presente)
+node_modules/
