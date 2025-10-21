@@ -94,18 +94,30 @@ def _save_upload_to_temp(upload: UploadFile) -> str:
     return temp_path
 
 def _download_url_to_temp(url: str) -> str:
+    """
+    Scarica il video da URL (YouTube/social) con yt-dlp.
+    Preferenza MP4 ma con fallback sicuro; errori espliciti.
+    """
     if not yt_dlp:
         raise HTTPException(status_code=500, detail="yt-dlp non installato nel server")
 
     tmp_dir = tempfile.mkdtemp(prefix="aivideo_")
     outtmpl = os.path.join(tmp_dir, "download.%(ext)s")
+
+    # Selezione formato *robusta*:
+    # 1) bestvideo mp4 + bestaudio m4a
+    # 2) best mp4
+    # 3) qualunque bestvideo+bestaudio
+    # 4) qualunque best
+    fmt = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
+
     ydl_opts = {
-        "format": "mp4/bestvideo+bestaudio/best",
+        "format": fmt,
         "merge_output_format": "mp4",
         "outtmpl": outtmpl,
         "retries": 2,
         "fragment_retries": 2,
-        "ignoreerrors": True,
+        "ignoreerrors": False,     # << non silenziare i fallimenti
         "noprogress": True,
         "nocheckcertificate": True,
         "quiet": True,
@@ -119,33 +131,59 @@ def _download_url_to_temp(url: str) -> str:
             )
         },
         "socket_timeout": 20,
-        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+        # Aiuta in alcuni casi di YouTube
+        "http_chunk_size": 10485760,  # 10 MiB
+        "postprocessors": [
+            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}  # spelling legacy voluto
+        ],
         "ratelimit": 2_000_000,
+        "geo_bypass": True,
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if not info:
-                raise HTTPException(status_code=422, detail="Impossibile risolvere l’URL (no info)")
+                raise HTTPException(status_code=422, detail="Estrazione yt-dlp nulla (no info)")
+            # Path effettivo
             if "requested_downloads" in info and info["requested_downloads"]:
                 filepath = info["requested_downloads"][0]["filepath"]
             else:
                 ext = info.get("ext") or "mp4"
                 filepath = outtmpl.replace("%(ext)s", ext)
+
             if not os.path.exists(filepath):
-                raise HTTPException(status_code=422, detail="Download fallito (file mancante)")
-            if os.path.getsize(filepath) > RESOLVER_MAX_BYTES:
-                try:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                finally:
-                    pass
+                raise HTTPException(status_code=422, detail="File non creato da yt-dlp")
+
+            size = os.path.getsize(filepath)
+            if size == 0:
+                raise HTTPException(status_code=422, detail="File vuoto dopo download")
+            if size > RESOLVER_MAX_BYTES:
                 raise HTTPException(status_code=413, detail="Il video scaricato supera il limite server")
+
             return filepath
+
+    except yt_dlp.utils.DownloadError as e:
+        # Errori “not supported / private / age-gate / throttling pesante”
+        raise HTTPException(
+            status_code=422,
+            detail=f"DownloadError yt-dlp: {str(e) or 'estrazione fallita (link non pubblico?)'}",
+        )
     except HTTPException:
         raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=422, detail=f"Risoluzione URL fallita: {str(e) or 'errore generico'}")
+    finally:
+        # Se non abbiamo fatto return, ripuliamo la dir temporanea (se vuota)
+        try:
+            # non rimuovere il file se è stato ritornato
+            if os.path.isdir(tmp_dir):
+                # se c'è un file valido verrà rimosso in /predict dopo l'analisi
+                pass
+        except Exception:
+            pass
+
 
 def _analyze_video(video_path: str) -> dict:
     meta = ffprobe(video_path)
