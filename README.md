@@ -1,12 +1,22 @@
-# AI Video Detector (CPU-only) — URL Social/YouTube o Upload (<= 50MB)
+# AI-Video Detector (FastAPI)
+
+Backend FastAPI + Gunicorn per stimare la plausibilità che un video sia generato da AI.
 
 ## Endpoints
-- `GET /` → form HTML minimale
-- `GET /healthz`
-- `POST /predict` (form-data: `url` *oppure* `file`)
-- `GET /predict-get?url=...`
-- `GET /predict?url=...` (alias)
 
-## Esempi
-curl -F "url=https://www.youtube.com/watch?v=U2BEMKvyT4U" https://<host>/predict
-open "https://<host>/predict?url=https://www.youtube.com/watch?v=U2BEMKvyT4U"
+- `GET /healthz` → "ok"
+- `GET /predict-get?url=...` (alias `GET /predict`)  
+- `POST /predict` (form-data: `url` **oppure** `file`; opzionale `cookies_b64`)
+- `POST /analyze` (alias WP)  
+- `POST /analyze-url` (alias WP)
+
+Output (JSON):
+```json
+{
+  "ai_score": 0.51,
+  "confidence": 0.72,
+  "details": {
+    "parts": {"metadata": 0.50, "frame_artifacts": 0.54, "audio": 0.45},
+    "ffprobe": {...}
+  }
+}
