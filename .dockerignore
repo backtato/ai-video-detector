@@ -1,41 +1,31 @@
-# VCS / IDE
-.git
-.gitignore
-.gitattributes
-.github
-.idea
-.vscode
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.swp
-*.swo
-*.DS_Store
-
-# Python venv
-.venv
-env
-venv
-ENV
-
-# Build / dist / cache
-build/
-dist/
 *.egg-info/
+.venv/
+venv/
+.env
+.env.*
 .pytest_cache/
-.mypy_cache/
 .cache/
 
-# Dati locali e temporanei
-*.log
-tmp/
-temp/
-*.mp4
-*.webm
-*.mkv
-*.mov
-*.bin
+# VCS
+.git/
+.gitignore
+.gitattributes
 
-# Node (se presente)
-node_modules/
+# IDE
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Build/Dist
+build/
+dist/
+coverage/
+htmlcov/
