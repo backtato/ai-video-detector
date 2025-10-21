@@ -95,29 +95,64 @@ def _save_upload_to_temp(upload: UploadFile) -> str:
 
 def _download_url_to_temp(url: str) -> str:
     """
-    Scarica il video da URL (YouTube/social) con yt-dlp.
-    Preferenza MP4 ma con fallback sicuro; errori espliciti.
+    1) Prova con yt-dlp (YouTube/social) usando client 'android'/'web' per aggirare il gate.
+    2) Se presente YTDLP_COOKIES_B64, carica i cookie (Netscape) e li passa a yt-dlp.
+    3) Se l'URL è diretto a file (.mp4/.webm/.mkv/.mov), usa fallback HTTP.
     """
+    import base64
+    def _http_fallback(u: str) -> str:
+        import requests
+        r = requests.get(u, stream=True, timeout=25, headers={
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Pixel 3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
+        })
+        if r.status_code != 200:
+            raise HTTPException(status_code=422, detail=f"Download HTTP fallito (status {r.status_code})")
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        looks_video = ("video" in ctype) or any(u.lower().split("?",1)[0].endswith(ext) for ext in (".mp4",".webm",".mkv",".mov"))
+        # anche se non sembra video, proviamo lo stesso: alcuni CDN non mettono Content-Type
+        fd, path = tempfile.mkdtemp(prefix="aivideo_"), None
+        tmpdir = fd
+        try:
+            ext = ".mp4" if ".mp4" in u.lower() else (".webm" if ".webm" in u.lower() else (".mkv" if ".mkv" in u.lower() else (".mov" if ".mov" in u.lower() else ".bin")))
+            path = os.path.join(tmpdir, f"download{ext}")
+            size = 0
+            with open(path, "wb") as out:
+                for chunk in r.iter_content(chunk_size=1024*512):
+                    if not chunk: break
+                    size += len(chunk)
+                    if size > RESOLVER_MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="Il video scaricato supera il limite server (fallback)")
+                    out.write(chunk)
+            if os.path.getsize(path) == 0:
+                raise HTTPException(status_code=422, detail="File vuoto dopo download HTTP")
+            return path
+        except:
+            # cleanup temp dir on failure
+            try: shutil.rmtree(tmpdir, ignore_errors=True)
+            except: pass
+            raise
+
+    # Se URL sembra già un file diretto, prova subito il fallback HTTP
+    if any(url.lower().split("?",1)[0].endswith(ext) for ext in (".mp4",".webm",".mkv",".mov")):
+        return _http_fallback(url)
+
     if not yt_dlp:
         raise HTTPException(status_code=500, detail="yt-dlp non installato nel server")
 
     tmp_dir = tempfile.mkdtemp(prefix="aivideo_")
     outtmpl = os.path.join(tmp_dir, "download.%(ext)s")
 
-    # Selezione formato *robusta*:
-    # 1) bestvideo mp4 + bestaudio m4a
-    # 2) best mp4
-    # 3) qualunque bestvideo+bestaudio
-    # 4) qualunque best
+    # Formato robusto (preferisci mp4 ma con fallback)
     fmt = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
 
+    # Opzioni yt-dlp con client 'android' + 'web' per aggirare il gate
     ydl_opts = {
         "format": fmt,
         "merge_output_format": "mp4",
         "outtmpl": outtmpl,
         "retries": 2,
         "fragment_retries": 2,
-        "ignoreerrors": False,     # << non silenziare i fallimenti
+        "ignoreerrors": False,
         "noprogress": True,
         "nocheckcertificate": True,
         "quiet": True,
@@ -125,27 +160,44 @@ def _download_url_to_temp(url: str) -> str:
         "nopart": True,
         "http_headers": {
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "Mozilla/5.0 (Linux; Android 10; Pixel 3) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0 Safari/537.36"
+                "Chrome/120.0 Mobile Safari/537.36"
             )
         },
-        "socket_timeout": 20,
-        # Aiuta in alcuni casi di YouTube
+        "socket_timeout": 25,
         "http_chunk_size": 10485760,  # 10 MiB
-        "postprocessors": [
-            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}  # spelling legacy voluto
-        ],
+        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
         "ratelimit": 2_000_000,
         "geo_bypass": True,
+        # 👇 Forza client YouTube "android" (con fallback a web) per evitare il prompt "sign in to confirm"
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
+        },
     }
+
+    # Cookie opzionali via env (Netscape cookies.txt in base64)
+    cookie_b64 = os.getenv("YTDLP_COOKIES_B64")
+    cookie_file = None
+    if cookie_b64:
+        try:
+            raw = base64.b64decode(cookie_b64)
+            fd, cookie_file = tempfile.mkstemp(prefix="cookie_", text=True)
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            ydl_opts["cookiefile"] = cookie_file
+        except Exception as e:
+            traceback.print_exc()
+            # Non bloccare: prosegui senza cookie ma lascia traccia
+            pass
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if not info:
                 raise HTTPException(status_code=422, detail="Estrazione yt-dlp nulla (no info)")
-            # Path effettivo
             if "requested_downloads" in info and info["requested_downloads"]:
                 filepath = info["requested_downloads"][0]["filepath"]
             else:
@@ -164,25 +216,24 @@ def _download_url_to_temp(url: str) -> str:
             return filepath
 
     except yt_dlp.utils.DownloadError as e:
-        # Errori “not supported / private / age-gate / throttling pesante”
-        raise HTTPException(
-            status_code=422,
-            detail=f"DownloadError yt-dlp: {str(e) or 'estrazione fallita (link non pubblico?)'}",
-        )
+        # Se YouTube richiede login/bot-check e non hai cookie, spiega come fornirli
+        msg = str(e) or ""
+        hint = ""
+        if "Sign in to confirm you're not a bot" in msg or "Sign in to confirm you’re not a bot" in msg:
+            hint = " (YouTube richiede cookie: imposta env YTDLP_COOKIES_B64 con il file cookies.txt in base64)"
+        raise HTTPException(status_code=422, detail=f"DownloadError yt-dlp: {msg}{hint}")
     except HTTPException:
         raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=422, detail=f"Risoluzione URL fallita: {str(e) or 'errore generico'}")
     finally:
-        # Se non abbiamo fatto return, ripuliamo la dir temporanea (se vuota)
-        try:
-            # non rimuovere il file se è stato ritornato
-            if os.path.isdir(tmp_dir):
-                # se c'è un file valido verrà rimosso in /predict dopo l'analisi
-                pass
-        except Exception:
-            pass
+        # pulizia file cookie
+        if cookie_file:
+            try: os.remove(cookie_file)
+            except: pass
+        # NOTA: non rimuoviamo tmp_dir qui se abbiamo restituito un file dentro; /predict lo cancellerà dopo l'analisi
+
 
 
 def _analyze_video(video_path: str) -> dict:
