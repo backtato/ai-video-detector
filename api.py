@@ -1,5 +1,4 @@
 import os
-import io
 import shutil
 import tempfile
 import traceback
@@ -25,46 +24,48 @@ YTDLP_COOKIES_B64ENV = os.getenv("YTDLP_COOKIES_B64", "")
 try:
     import yt_dlp  # type: ignore
 except Exception:
-    yt_dlp = None  # Il server può girare anche senza (solo URL diretti)
+    yt_dlp = None  # Il server può girare anche senza yt-dlp (solo URL diretti)
 
-# --- Calibrazione / combinazione (fallback sicuri se i moduli non ci sono) ---
+# --- Calibrazione / combinazione (import robusti + fallback) ---
+# Prova prima app.config, poi config alla root
+ENSEMBLE_WEIGHTS = {"metadata": 0.33, "frame_artifacts": 0.34, "audio": 0.33}
+CALIBRATION = None
 try:
-    from calibration import calibrate as _calibrate  # type: ignore
+    from app.calibration import calibrate as _calibrate  # type: ignore
+    from app.calibration import combine_scores as _combine_scores  # type: ignore
 except Exception:
-    def _calibrate(x: float) -> Tuple[float, float]:
-        # (score_calibrato, confidenza) – fallback neutro
-        return float(x), 0.5
+    try:
+        from calibration import calibrate as _calibrate  # type: ignore
+        from calibration import combine_scores as _combine_scores  # type: ignore
+    except Exception:
+        def _calibrate(x, *args, **kwargs):
+            # ritorna (score_calibrato, confidenza)
+            return float(x), 0.5
+        def _combine_scores(d, *args, **kwargs):
+            vals = [float(v) for v in d.values() if v is not None]
+            return ((sum(vals) / len(vals)) if vals else 0.5, d)
 
+# Prova a caricare i pesi e la calibrazione, prima da app.config poi da config
 try:
-    from calibration import combine_scores as _combine_scores  # type: ignore
+    from app.config import ENSEMBLE_WEIGHTS as _EW  # type: ignore
+    ENSEMBLE_WEIGHTS = _EW or ENSEMBLE_WEIGHTS
 except Exception:
-    def _combine_scores(d: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
-        vals = [float(v) for v in d.values() if v is not None]
-        return ((sum(vals) / len(vals)) if vals else 0.5, d)
+    try:
+        from config import ENSEMBLE_WEIGHTS as _EW  # type: ignore
+        ENSEMBLE_WEIGHTS = _EW or ENSEMBLE_WEIGHTS
+    except Exception:
+        pass
+try:
+    from app.config import CALIBRATION as _CAL  # type: ignore
+    CALIBRATION = _CAL
+except Exception:
+    try:
+        from config import CALIBRATION as _CAL  # type: ignore
+        CALIBRATION = _CAL
+    except Exception:
+        pass
 
-# --- Calibrazione / combinazione (fallback sicuri se i moduli non ci sono) ---
-try:
-    from calibration import calibrate as _calibrate  # type: ignore
-    from calibration import combine_scores as _combine_scores  # type: ignore
-except Exception:
-    def _calibrate(x, *args, **kwargs):
-        # ritorna (score_calibrato, confidenza)
-        return float(x), 0.5
-    def _combine_scores(d, *args, **kwargs):
-        vals = [float(v) for v in d.values() if v is not None]
-        return ((sum(vals) / len(vals)) if vals else 0.5, d)
-
-# Pesature e parametri di calibrazione (se esistono nel tuo progetto)
-try:
-    from config import ENSEMBLE_WEIGHTS  # dict es: {"metadata":0.33, "frame_artifacts":0.34, "audio":0.33}
-except Exception:
-    ENSEMBLE_WEIGHTS = {"metadata": 0.33, "frame_artifacts": 0.34, "audio": 0.33}
-
-try:
-    from config import CALIBRATION  # eventuali parametri per calibrate()
-except Exception:
-    CALIBRATION = None
-# --- Detectors (fallback neutrali) ---
+# --- Detectors (fallback neutrali se non disponibili) ---
 try:
     from app.detectors.metadata import ffprobe, score_metadata  # type: ignore
 except Exception:
@@ -136,7 +137,8 @@ def _http_fallback(url: str) -> str:
             size = 0
             with open(path, "wb") as out:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if not chunk: continue
+                    if not chunk: 
+                        continue
                     size += len(chunk)
                     if size > RESOLVER_MAX_BYTES:
                         raise HTTPException(status_code=413, detail="Il video scaricato supera il limite server (fallback)")
@@ -240,7 +242,10 @@ def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
 def _analyze_video(path: str) -> Dict[str, Any]:
     """
     Esegue i tre detector, combina, calibra e ritorna JSON.
+    Compatibile sia con combine_scores(raw, weights) che con combine_scores(raw).
+    Idem per calibrate(score, CALIBRATION) o calibrate(score).
     """
+    # ffprobe + punteggi
     try:
         meta = ffprobe(path)
     except Exception:
@@ -266,8 +271,21 @@ def _analyze_video(path: str) -> Dict[str, Any]:
         "frame_artifacts": s_frame,
         "audio": s_audio,
     }
-    combined, parts = _combine_scores(raw)
-    calibrated, confidence = _calibrate(combined)
+
+    # combine_scores: prova con pesi; se la tua versione non li vuole, riprova senza
+    try:
+        combined, parts = _combine_scores(raw, ENSEMBLE_WEIGHTS)
+    except TypeError:
+        combined, parts = _combine_scores(raw)
+
+    # calibrate: prova con parametri; se non servono, fallback
+    try:
+        if CALIBRATION is not None:
+            calibrated, confidence = _calibrate(combined, CALIBRATION)
+        else:
+            calibrated, confidence = _calibrate(combined)
+    except TypeError:
+        calibrated, confidence = _calibrate(combined)
 
     return {
         "ai_score": round(float(calibrated), 4),
@@ -275,6 +293,8 @@ def _analyze_video(path: str) -> Dict[str, Any]:
         "details": {
             "parts": parts,
             "ffprobe": meta,
+            # opzionale: mostrare i pesi usati ai fini di trasparenza/debug
+            # "config": {"weights": ENSEMBLE_WEIGHTS, "calibration": bool(CALIBRATION)}
         }
     }
 
