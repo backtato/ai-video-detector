@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import traceback
 import base64
+import inspect
 from typing import Optional, Tuple, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -10,7 +11,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # =======================
-# Config da ENV (source of truth in questo file)
+# Config da ENV
 # =======================
 MAX_UPLOAD_BYTES     = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))   # 50 MB
 RESOLVER_MAX_BYTES   = int(os.getenv("RESOLVER_MAX_BYTES", str(120 * 1024 * 1024)))
@@ -24,48 +25,54 @@ YTDLP_COOKIES_B64ENV = os.getenv("YTDLP_COOKIES_B64", "")
 try:
     import yt_dlp  # type: ignore
 except Exception:
-    yt_dlp = None  # Il server può girare anche senza yt-dlp (solo URL diretti)
+    yt_dlp = None  # Il server può girare anche senza yt-dlp
 
-# --- Calibrazione / combinazione (import robusti + fallback) ---
-# Prova prima app.config, poi config alla root
+# =======================
+# Calibrazione / combinazione (import robusti)
+# =======================
 ENSEMBLE_WEIGHTS = {"metadata": 0.33, "frame_artifacts": 0.34, "audio": 0.33}
 CALIBRATION = None
+
+# 1) Prova import dalla root (nel repo c'è calibration.py in root)
 try:
-    from app.calibration import calibrate as _calibrate  # type: ignore
-    from app.calibration import combine_scores as _combine_scores  # type: ignore
+    from calibration import calibrate as _calibrate  # type: ignore
+    from calibration import combine_scores as _combine_scores  # type: ignore
 except Exception:
+    # 2) Fallback: eventuale modulo sotto app/
     try:
-        from calibration import calibrate as _calibrate  # type: ignore
-        from calibration import combine_scores as _combine_scores  # type: ignore
+        from app.calibration import calibrate as _calibrate  # type: ignore
+        from app.calibration import combine_scores as _combine_scores  # type: ignore
     except Exception:
         def _calibrate(x, *args, **kwargs):
-            # ritorna (score_calibrato, confidenza)
             return float(x), 0.5
         def _combine_scores(d, *args, **kwargs):
             vals = [float(v) for v in d.values() if v is not None]
             return ((sum(vals) / len(vals)) if vals else 0.5, d)
 
-# Prova a caricare i pesi e la calibrazione, prima da app.config poi da config
+# Pesi/calibrazione (prima root config.py, poi app.config)
 try:
-    from app.config import ENSEMBLE_WEIGHTS as _EW  # type: ignore
-    ENSEMBLE_WEIGHTS = _EW or ENSEMBLE_WEIGHTS
+    from config import ENSEMBLE_WEIGHTS as _EW  # type: ignore
+    if _EW: ENSEMBLE_WEIGHTS = _EW
 except Exception:
     try:
-        from config import ENSEMBLE_WEIGHTS as _EW  # type: ignore
-        ENSEMBLE_WEIGHTS = _EW or ENSEMBLE_WEIGHTS
+        from app.config import ENSEMBLE_WEIGHTS as _EW  # type: ignore
+        if _EW: ENSEMBLE_WEIGHTS = _EW
     except Exception:
         pass
+
 try:
-    from app.config import CALIBRATION as _CAL  # type: ignore
+    from config import CALIBRATION as _CAL  # type: ignore
     CALIBRATION = _CAL
 except Exception:
     try:
-        from config import CALIBRATION as _CAL  # type: ignore
+        from app.config import CALIBRATION as _CAL  # type: ignore
         CALIBRATION = _CAL
     except Exception:
         pass
 
-# --- Detectors (fallback neutrali se non disponibili) ---
+# =======================
+# Detectors (fallback neutrali)
+# =======================
 try:
     from app.detectors.metadata import ffprobe, score_metadata  # type: ignore
 except Exception:
@@ -81,6 +88,45 @@ try:
     from app.detectors.audio import score_audio  # type: ignore
 except Exception:
     def score_audio(path: str) -> float: return 0.5
+
+# =======================
+# Wrapper SAFE per firme diverse
+# =======================
+def _combine_scores_safe(raw: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
+    """
+    Se combine_scores richiede 'weights', li passiamo.
+    Se non li accetta, richiamiamo senza.
+    """
+    try:
+        params = list(inspect.signature(_combine_scores).parameters.keys())
+    except Exception:
+        params = []
+    try:
+        if "weights" in params or len(params) >= 2:
+            return _combine_scores(raw, ENSEMBLE_WEIGHTS)
+        return _combine_scores(raw)
+    except TypeError:
+        # fallback incrociato
+        try:
+            return _combine_scores(raw, ENSEMBLE_WEIGHTS)
+        except Exception:
+            return _combine_scores(raw)
+
+def _calibrate_safe(score: float) -> Tuple[float, float]:
+    """
+    Se calibrate accetta parametri (es. CALIBRATION), li passiamo.
+    Altrimenti chiamiamo solo con lo score.
+    """
+    try:
+        params = list(inspect.signature(_calibrate).parameters.keys())
+    except Exception:
+        params = []
+    try:
+        if "params" in params or len(params) >= 2:
+            return _calibrate(score, CALIBRATION)
+        return _calibrate(score)
+    except TypeError:
+        return _calibrate(score)
 
 # =======================
 # FastAPI app + CORS
@@ -126,7 +172,7 @@ def _save_upload_to_temp(upload: UploadFile) -> str:
 
 def _http_fallback(url: str) -> str:
     """
-    Scarica via HTTP(S) grezzo quando l'URL punta già a un file .mp4/.webm/.mov/.mkv
+    Scarica via HTTP(S) grezzo quando l'URL è già un file .mp4/.webm/.mov/.mkv
     """
     import requests
     tmpdir = tempfile.mkdtemp(prefix="aivideo_http_")
@@ -137,7 +183,7 @@ def _http_fallback(url: str) -> str:
             size = 0
             with open(path, "wb") as out:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if not chunk: 
+                    if not chunk:
                         continue
                     size += len(chunk)
                     if size > RESOLVER_MAX_BYTES:
@@ -153,10 +199,8 @@ def _http_fallback(url: str) -> str:
 
 def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
     """
-    1) Se URL è diretto a file (.mp4/.webm/.mov/.mkv) → usa HTTP fallback
-    2) Altrimenti prova yt-dlp con client 'android/web' (best effort)
-       - se passato cookies_b64 (Base64 Netscape cookies.txt) → usalo
-       - altrimenti se YTDLP_COOKIES_B64ENV è impostato → usalo
+    1) URL diretto (.mp4/.webm/.mov/.mkv) → HTTP fallback
+    2) Altrimenti yt-dlp (client android/web); cookies_b64 opzionale (per admin)
     """
     lower = url.lower().split("?", 1)[0]
     if any(lower.endswith(ext) for ext in (".mp4", ".webm", ".mov", ".mkv")):
@@ -167,7 +211,7 @@ def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
 
     tmp_dir = tempfile.mkdtemp(prefix="aivideo_")
     outtmpl = os.path.join(tmp_dir, "download.%(ext)s")
-    fmt = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"  # robusto
+    fmt = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
 
     ydl_opts = {
         "format": fmt,
@@ -179,14 +223,9 @@ def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
         "retries": 2,
         "socket_timeout": 15,
         "user_agent": "Mozilla/5.0 (Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],
-            }
-        },
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
 
-    # Gestione cookie opzionale (per admin): per-request > env > nessuno
     cookie_file = None
     cookie_b64 = (cookies_b64 or "").strip() or (YTDLP_COOKIES_B64ENV.strip() if YTDLP_COOKIES_B64ENV else "")
     if cookie_b64:
@@ -197,7 +236,6 @@ def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
                 f.write(raw)
             ydl_opts["cookiefile"] = cookie_file
         except Exception:
-            # se i cookie sono malformati, ignora e prova senza
             cookie_file = None
 
     try:
@@ -226,7 +264,7 @@ def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
         msg = str(e) or ""
         hint = ""
         if ("Sign in to confirm you're not a bot" in msg) or ("Sign in to confirm you’re not a bot" in msg):
-            hint = " (YouTube richiede cookie: puoi passare cookies_b64 per questa richiesta, oppure configurare YTDLP_COOKIES_B64 a livello server)"
+            hint = " (YouTube richiede cookie: passa cookies_b64 per questa richiesta o configura YTDLP_COOKIES_B64)"
         raise HTTPException(status_code=422, detail=f"DownloadError yt-dlp: {msg}{hint}")
     except HTTPException:
         raise
@@ -234,7 +272,6 @@ def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
         traceback.print_exc()
         raise HTTPException(status_code=422, detail=f"Risoluzione URL fallita: {str(e) or 'errore generico'}")
     finally:
-        # pulizia cookies temporanei
         if cookie_file:
             try: os.remove(cookie_file)
             except Exception: pass
@@ -242,10 +279,9 @@ def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
 def _analyze_video(path: str) -> Dict[str, Any]:
     """
     Esegue i tre detector, combina, calibra e ritorna JSON.
-    Compatibile sia con combine_scores(raw, weights) che con combine_scores(raw).
-    Idem per calibrate(score, CALIBRATION) o calibrate(score).
+    Compatibile con combine_scores(raw, weights) o combine_scores(raw),
+    e calibrate(score, CALIBRATION) o calibrate(score).
     """
-    # ffprobe + punteggi
     try:
         meta = ffprobe(path)
     except Exception:
@@ -266,26 +302,10 @@ def _analyze_video(path: str) -> Dict[str, Any]:
     except Exception:
         s_audio = 0.5
 
-    raw = {
-        "metadata": s_meta,
-        "frame_artifacts": s_frame,
-        "audio": s_audio,
-    }
+    raw = {"metadata": s_meta, "frame_artifacts": s_frame, "audio": s_audio}
 
-    # combine_scores: prova con pesi; se la tua versione non li vuole, riprova senza
-    try:
-        combined, parts = _combine_scores(raw, ENSEMBLE_WEIGHTS)
-    except TypeError:
-        combined, parts = _combine_scores(raw)
-
-    # calibrate: prova con parametri; se non servono, fallback
-    try:
-        if CALIBRATION is not None:
-            calibrated, confidence = _calibrate(combined, CALIBRATION)
-        else:
-            calibrated, confidence = _calibrate(combined)
-    except TypeError:
-        calibrated, confidence = _calibrate(combined)
+    combined, parts = _combine_scores_safe(raw)
+    calibrated, confidence = _calibrate_safe(combined)
 
     return {
         "ai_score": round(float(calibrated), 4),
@@ -293,7 +313,6 @@ def _analyze_video(path: str) -> Dict[str, Any]:
         "details": {
             "parts": parts,
             "ffprobe": meta,
-            # opzionale: mostrare i pesi usati ai fini di trasparenza/debug
             # "config": {"weights": ENSEMBLE_WEIGHTS, "calibration": bool(CALIBRATION)}
         }
     }
