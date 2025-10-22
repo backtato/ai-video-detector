@@ -32,7 +32,7 @@ except Exception:
 ENSEMBLE_WEIGHTS = {"metadata": 0.33, "frame_artifacts": 0.34, "audio": 0.33}
 CALIBRATION = None
 
-# Importa prima dalla root (nel tuo repo i file sono in root), poi da app/
+# Importa prima dalla root (nel repo i file sono in root), poi da app/
 try:
     from calibration import calibrate as _calibrate  # type: ignore
     from calibration import combine_scores as _combine_scores  # type: ignore
@@ -109,7 +109,7 @@ app.add_middleware(
 )
 
 # =======================
-# Helpers
+# Helpers I/O
 # =======================
 def _save_upload_to_temp(upload: UploadFile) -> str:
     suffix = os.path.splitext(upload.filename or "")[-1] or ".bin"
@@ -237,112 +237,182 @@ def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
 
 # ---------- Normalizzazione score ----------
 def _flatten_scores_dict(raw_mixed: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, Any]]:
+  """
+  Converte un dict con valori misti (float, tuple, dict, ecc.) in:
+    - raw_float: solo float per combine_scores
+    - parts: dettagli secondari (per JSON)
+  """
+  raw_float: Dict[str, float] = {}
+  parts: Dict[str, Any] = {}
+  for k, v in raw_mixed.items():
+      score_val: float = 0.5
+      extra: Any = {}
+      try:
+          if isinstance(v, (tuple, list)) and len(v) > 0:
+              try: score_val = float(v[0])
+              except Exception: score_val = 0.5
+              if len(v) > 1: extra = {"extra": v[1:]}
+          elif isinstance(v, dict) and ("score" in v):
+              try: score_val = float(v.get("score", 0.5))
+              except Exception: score_val = 0.5
+              extra = v
+          elif isinstance(v, (int, float)):
+              score_val = float(v)
+              extra = {}
+          elif isinstance(v, str):
+              try: score_val = float(v)
+              except Exception: score_val = 0.5
+              extra = {"raw": v}
+          else:
+              score_val = 0.5
+              extra = {"raw": repr(v)}
+      except Exception:
+          score_val = 0.5
+          extra = {"raw": "coercion_error"}
+      if score_val < 0.0: score_val = 0.0
+      if score_val > 1.0: score_val = 1.0
+      raw_float[k] = score_val
+      parts[k] = extra
+  return raw_float, parts
+
+# ---------- Adattività conservativa ----------
+def _extract_quality(meta: Dict[str, Any]) -> Dict[str, float]:
+    """Estrae indicatori rozzi di qualità dal ffprobe (se disponibili)."""
+    width = height = fps = bitrate_kbps = 0.0
+    try:
+        for s in (meta.get("streams") or []):
+            if s.get("codec_type") == "video":
+                width = float(s.get("width", width) or width)
+                height = float(s.get("height", height) or height)
+                fr = s.get("avg_frame_rate") or "0/0"
+                if isinstance(fr, str) and "/" in fr:
+                    a, b = fr.split("/", 1)
+                    fb = float(b or 1.0)
+                    fps = (float(a) / fb) if fb != 0 else fps
+        fmt = meta.get("format") or {}
+        br = fmt.get("bit_rate") or fmt.get("bitrate") or 0
+        try: bitrate_kbps = float(br) / 1000.0
+        except Exception: bitrate_kbps = 0.0
+    except Exception:
+        pass
+    dur = 0.0
+    try: dur = float((meta.get("format") or {}).get("duration") or 0.0)
+    except Exception: dur = 0.0
+    return {"width": width, "height": height, "fps": fps, "bitrate_kbps": bitrate_kbps, "duration": dur}
+
+def _quality_factor(q: Dict[str, float]) -> float:
     """
-    Converte un dict con valori misti (float, tuple, dict, ecc.) in:
-      - raw_float: solo float per combine_scores
-      - parts: dettagli secondari (per JSON)
-    Regole:
-      - tuple/list -> primo elemento come score; resto in parts[k]["extra"]
-      - dict con 'score' -> usa quel valore; tutto il dict in parts[k]
-      - numerico -> usa come score; parts[k] = {}
-      - stringa numerica -> cast; altrimenti default 0.5 con parts[k]["raw"]
-      - altro -> score 0.5 e parts[k]["raw"] = repr(v)
+    Fattore 0..1 di qualità (molto conservativo).
+    Valori bassi solo se bitrate < 900 kbps e/o risoluzione < 720p.
     """
-    raw_float: Dict[str, float] = {}
-    parts: Dict[str, Any] = {}
+    w, h = q["width"], q["height"]
+    br = q["bitrate_kbps"]
+    fps = q["fps"]
 
-    for k, v in raw_mixed.items():
-        score_val: float = 0.5
-        extra: Any = {}
+    # risoluzione: <720p penalizza, >=1080p ok
+    max_side = max(w, h)
+    res_score = 0.0
+    if max_side <= 0:
+        res_score = 0.0
+    elif max_side < 720:
+        res_score = max(0.0, (max_side - 360) / (720 - 360))  # 360p~0 → 720p~1
+    elif max_side >= 1080:
+        res_score = 1.0
+    else:
+        res_score = 0.75 + 0.25 * ((max_side - 720) / (1080 - 720))
 
-        try:
-            if isinstance(v, (tuple, list)) and len(v) > 0:
-                try:
-                    score_val = float(v[0])
-                except Exception:
-                    score_val = 0.5
-                if len(v) > 1:
-                    extra = {"extra": v[1:]}
+    # bitrate: <900 kbps penalizza; >2500 ok
+    br_score = 0.0 if br <= 0 else min(1.0, max(0.0, (br - 900) / (2500 - 900)))
 
-            elif isinstance(v, dict) and ("score" in v):
-                try:
-                    score_val = float(v.get("score", 0.5))
-                except Exception:
-                    score_val = 0.5
-                extra = v
+    # fps: <20 penalizza, 30 ok
+    fps_score = 0.0 if fps <= 0 else min(1.0, max(0.0, (fps - 20) / (30 - 20)))
 
-            elif isinstance(v, (int, float)):
-                score_val = float(v)
-                extra = {}
+    # combinazione conservativa
+    qf = 0.5 * br_score + 0.35 * res_score + 0.15 * fps_score
+    return max(0.0, min(1.0, qf))
 
-            elif isinstance(v, str):
-                try:
-                    score_val = float(v)
-                except Exception:
-                    score_val = 0.5
-                extra = {"raw": v}
-
-            else:
-                score_val = 0.5
-                extra = {"raw": repr(v)}
-        except Exception:
-            score_val = 0.5
-            extra = {"raw": "coercion_error"}
-
-        # clamp tra 0 e 1 per sicurezza
-        if score_val < 0.0: score_val = 0.0
-        if score_val > 1.0: score_val = 1.0
-
-        raw_float[k] = score_val
-        parts[k] = extra
-
-    return raw_float, parts
-
-def _combine_scores_safe(raw_float_dict: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
+def _adaptive_weights(base: Dict[str, float], parts: Dict[str, float], meta: Dict[str, Any]) -> Dict[str, float]:
     """
-    La tua combine_scores richiede 'weights': passiamo sempre i pesi.
+    Riduce il peso di 'frame_artifacts' SOLO se qualità è bassa (bitrate < 900 kbps o <720p).
+    Riduzione massima 40%, altrimenti nessuna riduzione. Delta redistribuito su metadata/audio.
     """
-    return _combine_scores(raw_float_dict, ENSEMBLE_WEIGHTS)
+    q = _extract_quality(meta)
+    qf = _quality_factor(q)  # 0..1
+    w = dict(base)
+
+    low_quality = (q["bitrate_kbps"] > 0 and q["bitrate_kbps"] < 900) or (max(q["width"], q["height"]) > 0 and max(q["width"], q["height"]) < 720)
+    if low_quality:
+        # fattore tra 0.6 (qualità pessima) e 1.0 (qualità buona) → riduzione max 40%
+        frame_factor = 0.6 + 0.4 * qf
+    else:
+        frame_factor = 1.0
+
+    w_frame_old = w.get("frame_artifacts", 0.0)
+    w_frame_new = w_frame_old * frame_factor
+    delta = max(0.0, w_frame_old - w_frame_new)
+    w["frame_artifacts"] = w_frame_new
+
+    # Redistribuisci delta su metadata/audio proporzionalmente ai loro pesi
+    pool = {k: w.get(k, 0.0) for k in ("metadata", "audio") if k in w}
+    pool_sum = sum(pool.values())
+    if delta > 0 and pool_sum > 0:
+        for k in pool:
+            w[k] = w.get(k, 0.0) + delta * (pool[k] / pool_sum)
+
+    # Normalizza a somma 1
+    tot = sum(w.values()) or 1.0
+    for k in w:
+        w[k] = w[k] / tot
+    return w
+
+def _agreement_factor(vals: Dict[str, float]) -> float:
+    """
+    Accordo tra segnali: se sono molto diversi, la confidenza scende.
+    Ritorna 0.6..1.0 (conservativo).
+    """
+    try:
+        xs = [float(v) for v in vals.values()]
+        if not xs: return 0.7
+        mu = sum(xs)/len(xs)
+        var = sum((x-mu)**2 for x in xs)/len(xs)
+        f = 1.0 - min(0.4, var*3.0)  # var più grande → abbassa max di 0.4
+        return max(0.6, min(1.0, f))
+    except Exception:
+        return 0.7
 
 # =======================
 # Analisi
 # =======================
 def _analyze_video(path: str) -> Dict[str, Any]:
     """
-    Esegue i detector, normalizza in float, combina con pesi e calibra.
+    Esegue i detector, normalizza in float, combina con pesi ADATTIVI (conservativi) e calibra.
+    Confidenza finale modulata da durata, qualità e accordo tra segnali.
     """
     try:
         meta = ffprobe(path)
     except Exception:
         meta = {}
 
-    try:
-        m_val = score_metadata(meta)
-    except Exception:
-        m_val = 0.5
+    # punteggi grezzi
+    try: m_val = score_metadata(meta)
+    except Exception: m_val = 0.5
+    try: f_val = score_frame_artifacts(path)
+    except Exception: f_val = 0.5
+    try: a_val = score_audio(path)
+    except Exception: a_val = 0.5
 
-    try:
-        f_val = score_frame_artifacts(path)
-    except Exception:
-        f_val = 0.5
-
-    try:
-        a_val = score_audio(path)
-    except Exception:
-        a_val = 0.5
-
-    raw_mixed = {
-        "metadata": m_val,
-        "frame_artifacts": f_val,
-        "audio": a_val,
-    }
-
+    raw_mixed = { "metadata": m_val, "frame_artifacts": f_val, "audio": a_val }
     raw_float, extra_parts = _flatten_scores_dict(raw_mixed)
 
-    combined, comb_parts = _combine_scores_safe(raw_float)
+    # Pesi adattivi (conservativi)
+    adaptive_w = _adaptive_weights(ENSEMBLE_WEIGHTS, raw_float, meta)
+
+    # Combina (la tua combine_scores richiede SEMPRE i pesi)
+    combined, comb_parts = _combine_scores(raw_float, adaptive_w)
     if not isinstance(comb_parts, dict):
         comb_parts = extra_parts
 
+    # Calibra (supporta sia calibrate(score, params) che calibrate(score))
     try:
         if CALIBRATION is not None:
             calibrated, confidence = _calibrate(combined, CALIBRATION)
@@ -351,13 +421,30 @@ def _analyze_video(path: str) -> Dict[str, Any]:
     except TypeError:
         calibrated, confidence = _calibrate(combined)
 
+    # Confidenza robusta e conservativa
+    q = _extract_quality(meta)
+    dur = q["duration"] or 0.0
+    # durata: <=10s → 0.7; 10–20s → 0.7..0.95; >20s → 1.0
+    if dur <= 10:
+        dur_factor = 0.7
+    elif dur >= 20:
+        dur_factor = 1.0
+    else:
+        dur_factor = 0.7 + (dur - 10) / 10 * 0.25  # 0.70→0.95
+
+    qual_factor = 0.7 + 0.3 * _quality_factor(q)  # 0.7..1.0
+    agree_factor = _agreement_factor(raw_float)    # 0.6..1.0
+
+    confidence = float(confidence) * dur_factor * qual_factor * agree_factor
+    confidence = max(0.05, min(1.0, confidence))
+
     return {
         "ai_score": round(float(calibrated), 4),
         "confidence": round(float(confidence), 4),
         "details": {
-            "parts": comb_parts,
+            "parts": comb_parts,              # punteggi per canale (post-normalizzazione)
             "ffprobe": meta,
-            # "config": {"weights": ENSEMBLE_WEIGHTS, "calibration": bool(CALIBRATION)}
+            "adaptive_weights": adaptive_w,   # per trasparenza/debug
         }
     }
 
