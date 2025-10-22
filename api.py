@@ -42,6 +42,28 @@ except Exception:
         vals = [float(v) for v in d.values() if v is not None]
         return ((sum(vals) / len(vals)) if vals else 0.5, d)
 
+# --- Calibrazione / combinazione (fallback sicuri se i moduli non ci sono) ---
+try:
+    from calibration import calibrate as _calibrate  # type: ignore
+    from calibration import combine_scores as _combine_scores  # type: ignore
+except Exception:
+    def _calibrate(x, *args, **kwargs):
+        # ritorna (score_calibrato, confidenza)
+        return float(x), 0.5
+    def _combine_scores(d, *args, **kwargs):
+        vals = [float(v) for v in d.values() if v is not None]
+        return ((sum(vals) / len(vals)) if vals else 0.5, d)
+
+# Pesature e parametri di calibrazione (se esistono nel tuo progetto)
+try:
+    from config import ENSEMBLE_WEIGHTS  # dict es: {"metadata":0.33, "frame_artifacts":0.34, "audio":0.33}
+except Exception:
+    ENSEMBLE_WEIGHTS = {"metadata": 0.33, "frame_artifacts": 0.34, "audio": 0.33}
+
+try:
+    from config import CALIBRATION  # eventuali parametri per calibrate()
+except Exception:
+    CALIBRATION = None
 # --- Detectors (fallback neutrali) ---
 try:
     from app.detectors.metadata import ffprobe, score_metadata  # type: ignore
