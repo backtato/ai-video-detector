@@ -3,7 +3,6 @@ import shutil
 import tempfile
 import traceback
 import base64
-import inspect
 from typing import Optional, Tuple, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -25,20 +24,19 @@ YTDLP_COOKIES_B64ENV = os.getenv("YTDLP_COOKIES_B64", "")
 try:
     import yt_dlp  # type: ignore
 except Exception:
-    yt_dlp = None  # Il server può girare anche senza yt-dlp
+    yt_dlp = None  # Il server può girare anche senza yt-dlp (solo URL diretti)
 
 # =======================
-# Calibrazione / combinazione (import robusti)
+# Calibrazione / combinazione
 # =======================
 ENSEMBLE_WEIGHTS = {"metadata": 0.33, "frame_artifacts": 0.34, "audio": 0.33}
 CALIBRATION = None
 
-# 1) Prova import dalla root (nel repo c'è calibration.py in root)
+# Importa prima dalla root (nel tuo repo i file sono in root), poi da app/
 try:
     from calibration import calibrate as _calibrate  # type: ignore
     from calibration import combine_scores as _combine_scores  # type: ignore
 except Exception:
-    # 2) Fallback: eventuale modulo sotto app/
     try:
         from app.calibration import calibrate as _calibrate  # type: ignore
         from app.calibration import combine_scores as _combine_scores  # type: ignore
@@ -49,7 +47,7 @@ except Exception:
             vals = [float(v) for v in d.values() if v is not None]
             return ((sum(vals) / len(vals)) if vals else 0.5, d)
 
-# Pesi/calibrazione (prima root config.py, poi app.config)
+# Carica pesi/calibrazione opzionali da config se presenti
 try:
     from config import ENSEMBLE_WEIGHTS as _EW  # type: ignore
     if _EW: ENSEMBLE_WEIGHTS = _EW
@@ -88,45 +86,6 @@ try:
     from app.detectors.audio import score_audio  # type: ignore
 except Exception:
     def score_audio(path: str) -> float: return 0.5
-
-# =======================
-# Wrapper SAFE per firme diverse
-# =======================
-def _combine_scores_safe(raw: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
-    """
-    Se combine_scores richiede 'weights', li passiamo.
-    Se non li accetta, richiamiamo senza.
-    """
-    try:
-        params = list(inspect.signature(_combine_scores).parameters.keys())
-    except Exception:
-        params = []
-    try:
-        if "weights" in params or len(params) >= 2:
-            return _combine_scores(raw, ENSEMBLE_WEIGHTS)
-        return _combine_scores(raw)
-    except TypeError:
-        # fallback incrociato
-        try:
-            return _combine_scores(raw, ENSEMBLE_WEIGHTS)
-        except Exception:
-            return _combine_scores(raw)
-
-def _calibrate_safe(score: float) -> Tuple[float, float]:
-    """
-    Se calibrate accetta parametri (es. CALIBRATION), li passiamo.
-    Altrimenti chiamiamo solo con lo score.
-    """
-    try:
-        params = list(inspect.signature(_calibrate).parameters.keys())
-    except Exception:
-        params = []
-    try:
-        if "params" in params or len(params) >= 2:
-            return _calibrate(score, CALIBRATION)
-        return _calibrate(score)
-    except TypeError:
-        return _calibrate(score)
 
 # =======================
 # FastAPI app + CORS
@@ -264,7 +223,7 @@ def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
         msg = str(e) or ""
         hint = ""
         if ("Sign in to confirm you're not a bot" in msg) or ("Sign in to confirm you’re not a bot" in msg):
-            hint = " (YouTube richiede cookie: passa cookies_b64 per questa richiesta o configura YTDLP_COOKIES_B64)"
+            hint = " (YouTube richiede cookie: puoi passare cookies_b64 per questa richiesta, oppure configurare YTDLP_COOKIES_B64 a livello server)"
         raise HTTPException(status_code=422, detail=f"DownloadError yt-dlp: {msg}{hint}")
     except HTTPException:
         raise
@@ -276,11 +235,81 @@ def _download_url_to_temp(url: str, cookies_b64: Optional[str] = None) -> str:
             try: os.remove(cookie_file)
             except Exception: pass
 
+# ---------- Normalizzazione score ----------
+def _flatten_scores_dict(raw_mixed: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    """
+    Converte un dict con valori misti (float, tuple, dict, ecc.) in:
+      - raw_float: solo float per combine_scores
+      - parts: dettagli secondari (per JSON)
+    Regole:
+      - tuple/list -> primo elemento come score; resto in parts[k]["extra"]
+      - dict con 'score' -> usa quel valore; tutto il dict in parts[k]
+      - numerico -> usa come score; parts[k] = {}
+      - stringa numerica -> cast; altrimenti default 0.5 con parts[k]["raw"]
+      - altro -> score 0.5 e parts[k]["raw"] = repr(v)
+    """
+    raw_float: Dict[str, float] = {}
+    parts: Dict[str, Any] = {}
+
+    for k, v in raw_mixed.items():
+        score_val: float = 0.5
+        extra: Any = {}
+
+        try:
+            if isinstance(v, (tuple, list)) and len(v) > 0:
+                try:
+                    score_val = float(v[0])
+                except Exception:
+                    score_val = 0.5
+                if len(v) > 1:
+                    extra = {"extra": v[1:]}
+
+            elif isinstance(v, dict) and ("score" in v):
+                try:
+                    score_val = float(v.get("score", 0.5))
+                except Exception:
+                    score_val = 0.5
+                extra = v
+
+            elif isinstance(v, (int, float)):
+                score_val = float(v)
+                extra = {}
+
+            elif isinstance(v, str):
+                try:
+                    score_val = float(v)
+                except Exception:
+                    score_val = 0.5
+                extra = {"raw": v}
+
+            else:
+                score_val = 0.5
+                extra = {"raw": repr(v)}
+        except Exception:
+            score_val = 0.5
+            extra = {"raw": "coercion_error"}
+
+        # clamp tra 0 e 1 per sicurezza
+        if score_val < 0.0: score_val = 0.0
+        if score_val > 1.0: score_val = 1.0
+
+        raw_float[k] = score_val
+        parts[k] = extra
+
+    return raw_float, parts
+
+def _combine_scores_safe(raw_float_dict: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
+    """
+    La tua combine_scores richiede 'weights': passiamo sempre i pesi.
+    """
+    return _combine_scores(raw_float_dict, ENSEMBLE_WEIGHTS)
+
+# =======================
+# Analisi
+# =======================
 def _analyze_video(path: str) -> Dict[str, Any]:
     """
-    Esegue i tre detector, combina, calibra e ritorna JSON.
-    Compatibile con combine_scores(raw, weights) o combine_scores(raw),
-    e calibrate(score, CALIBRATION) o calibrate(score).
+    Esegue i detector, normalizza in float, combina con pesi e calibra.
     """
     try:
         meta = ffprobe(path)
@@ -288,30 +317,45 @@ def _analyze_video(path: str) -> Dict[str, Any]:
         meta = {}
 
     try:
-        s_meta = score_metadata(meta)
+        m_val = score_metadata(meta)
     except Exception:
-        s_meta = 0.5
+        m_val = 0.5
 
     try:
-        s_frame = score_frame_artifacts(path)
+        f_val = score_frame_artifacts(path)
     except Exception:
-        s_frame = 0.5
+        f_val = 0.5
 
     try:
-        s_audio = score_audio(path)
+        a_val = score_audio(path)
     except Exception:
-        s_audio = 0.5
+        a_val = 0.5
 
-    raw = {"metadata": s_meta, "frame_artifacts": s_frame, "audio": s_audio}
+    raw_mixed = {
+        "metadata": m_val,
+        "frame_artifacts": f_val,
+        "audio": a_val,
+    }
 
-    combined, parts = _combine_scores_safe(raw)
-    calibrated, confidence = _calibrate_safe(combined)
+    raw_float, extra_parts = _flatten_scores_dict(raw_mixed)
+
+    combined, comb_parts = _combine_scores_safe(raw_float)
+    if not isinstance(comb_parts, dict):
+        comb_parts = extra_parts
+
+    try:
+        if CALIBRATION is not None:
+            calibrated, confidence = _calibrate(combined, CALIBRATION)
+        else:
+            calibrated, confidence = _calibrate(combined)
+    except TypeError:
+        calibrated, confidence = _calibrate(combined)
 
     return {
         "ai_score": round(float(calibrated), 4),
         "confidence": round(float(confidence), 4),
         "details": {
-            "parts": parts,
+            "parts": comb_parts,
             "ffprobe": meta,
             # "config": {"weights": ENSEMBLE_WEIGHTS, "calibration": bool(CALIBRATION)}
         }
