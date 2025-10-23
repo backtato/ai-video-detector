@@ -3,10 +3,12 @@ import io
 import json
 import tempfile
 import traceback
+import shutil
+import subprocess
 from typing import Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi import params as fastapi_params  # <— per rilevare oggetti Form
+from fastapi import params as fastapi_params
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
@@ -38,7 +40,7 @@ except Exception:
     def score_audio(_path: str) -> float:
         return 0.45
 
-# --- Nuovi helper (import lazy + fallback) ---
+# --- Helper modulari (lazy import + fallback) ---
 def _import_social():
     try:
         from app.social import detect_source_profile
@@ -168,7 +170,7 @@ def _analyze_core(path: str,
         "details": details,
     }
 
-# --- Health & diagnostica leggera ---
+# --- Health & diagnostica ---
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
@@ -182,6 +184,18 @@ def env_cors():
     return {"ALLOWED_ORIGINS_raw": os.getenv("ALLOWED_ORIGINS", "*"),
             "parsed": allow_origins, "credentials": allow_credentials}
 
+@app.get("/ffprobe-status")
+def ffprobe_status():
+    path = shutil.which("ffprobe")
+    if not path:
+        return {"ffprobe_found": False, "path": None, "version": None}
+    try:
+        out = subprocess.check_output([path, "-version"], stderr=subprocess.STDOUT, text=True, timeout=3)
+        first = out.splitlines()[0] if out else ""
+    except Exception as e:
+        first = f"error: {e}"
+    return {"ffprobe_found": True, "path": path, "version": first}
+
 # --- API principali ---
 @app.post("/predict")
 async def predict(
@@ -192,7 +206,7 @@ async def predict(
     apply_prefilters: Optional[bool] = Form(default=None),
     window_sec: Optional[int] = Form(default=None),
 ):
-    # Se predict è chiamata direttamente (non via HTTP), i parametri possono essere oggetti Form → normalizza a None
+    # Normalizza se chiamata diretta (oggetti Form) -> None
     if isinstance(social_mode, fastapi_params.Form):       social_mode = None
     if isinstance(apply_prefilters, fastapi_params.Form):  apply_prefilters = None
     if isinstance(window_sec, fastapi_params.Form):        window_sec = None
@@ -207,6 +221,7 @@ async def predict(
 
     tmp_path = None
     try:
+        # --- INPUT: file upload ---
         if file:
             if getattr(file, "size", None) and int(file.size) > MAX_UPLOAD_BYTES:
                 raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_BYTES} bytes).")
@@ -216,17 +231,34 @@ async def predict(
             fd, tmp_path = tempfile.mkstemp(prefix="aivd_", suffix=".bin")
             with os.fdopen(fd, "wb") as f:
                 f.write(raw)
+
+        # --- INPUT: url (download "semplice") ---
         else:
             import requests
             r = requests.get(url, timeout=20, headers={"User-Agent": "AI-Video/1.0"})
             r.raise_for_status()
             content = r.content
-            if len(content) > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail="Downloaded media too large.")
             fd, tmp_path = tempfile.mkstemp(prefix="aivd_", suffix=".bin")
             with os.fdopen(fd, "wb") as f:
                 f.write(content)
 
+        # --- Guard: ffprobe deve vedere stream, altrimenti errore chiaro ---
+        info_probe = _ffprobe_safe(tmp_path)
+        if not info_probe.get("streams"):
+            ffprobe_path = shutil.which("ffprobe")
+            size_bytes = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+            raise HTTPException(
+                status_code=415,
+                detail={
+                    "error": "Unsupported or empty media: no audio/video streams found",
+                    "ffprobe_found": bool(ffprobe_path),
+                    "ffprobe_path": ffprobe_path,
+                    "file_size": size_bytes,
+                    "hint": "Se è un URL social, usa analyze-url o abilita yt-dlp; se è un upload, verifica che sia un vero video."
+                }
+            )
+
+        # --- Analisi core ---
         result = _analyze_core(
             path=tmp_path,
             apply_prefilters=bool(apply_prefilters),
@@ -247,7 +279,7 @@ async def predict(
             except Exception:
                 pass
 
-# Alias retro-compatibili — passano esplicitamente i parametri opzionali a None
+# --- Alias retro-compatibili (forward pulito dei parametri opzionali) ---
 @app.post("/analyze")
 async def analyze_alias(
     file: Optional[UploadFile] = File(default=None),
