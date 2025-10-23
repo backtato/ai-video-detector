@@ -1,23 +1,22 @@
 FROM python:3.11-slim
 
-ARG DEBIAN_FRONTEND=noninteractive
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
-# ffmpeg/ffprobe per analisi media (non-interactive)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+# --- Sistema + ffmpeg/ffprobe (necessario per ffprobe in runtime) ---
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
+# --- Working dir ---
 WORKDIR /app
 
-# Caching corretto
+# --- Dipendenze Python ---
 COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
+# --- Codice ---
 COPY . /app
 
-EXPOSE 8000
+# --- Gunicorn/port ---
+ENV WEB_CONCURRENCY=2
+ENV WORKER_TIMEOUT=120
+ENV PORT=8000
+
 CMD ["gunicorn", "-c", "gunicorn_conf.py", "api:app"]
