@@ -5,13 +5,14 @@ import tempfile
 import traceback
 from typing import Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 APP_NAME = os.getenv("APP_NAME", "ai-video-detector")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", "")  # opzionale
 DEFAULT_WINDOW_SEC = int(os.getenv("WINDOW_SEC", "3"))
 PREFILTERS_DEFAULT = os.getenv("PREFILTERS_DEFAULT", "0") == "1"
 
@@ -80,12 +81,19 @@ except Exception:
 
 app = FastAPI(title=APP_NAME)
 
-# --- CORS ---
+# --- CORS robusto e auto-safe ---
 allow_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()] or ["*"]
+use_wildcard = (allow_origins == ["*"])
+allow_origin_regex = ALLOWED_ORIGIN_REGEX or None
+
+# Regola: se wildcard, NIENTE credenziali (compatibilità browser); se origini specifiche, credenziali ok.
+allow_credentials = False if use_wildcard else True
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=True,
+    allow_origins=["*"] if use_wildcard else allow_origins,
+    allow_origin_regex=allow_origin_regex,  # opzionale
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -162,10 +170,21 @@ def _analyze_core(path: str,
         "details": details,
     }
 
+# --- Health & diagnostica leggera ---
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
 
+@app.get("/")
+def root():
+    return PlainTextResponse("ok")
+
+@app.get("/env-cors")
+def env_cors():
+    # utile per verificare cosa legge il container
+    return {"ALLOWED_ORIGINS_raw": ALLOWED_ORIGINS, "parsed": allow_origins, "credentials": allow_credentials}
+
+# --- API principali ---
 @app.post("/predict")
 async def predict(
     file: Optional[UploadFile] = File(default=None),
