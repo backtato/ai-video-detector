@@ -6,6 +6,7 @@ import traceback
 from typing import Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import params as fastapi_params  # <— per rilevare oggetti Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
@@ -44,7 +45,6 @@ def _import_social():
         return detect_source_profile
     except Exception:
         def _fallback_detect_source_profile(_ffp: Dict[str, Any], force_social: Optional[bool] = None) -> str:
-            # fallback prudente
             return "social" if force_social else "clean"
         return _fallback_detect_source_profile
 
@@ -85,14 +85,12 @@ app = FastAPI(title=APP_NAME)
 allow_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()] or ["*"]
 use_wildcard = (allow_origins == ["*"])
 allow_origin_regex = ALLOWED_ORIGIN_REGEX or None
-
-# Regola: se wildcard, NIENTE credenziali (compatibilità browser); se origini specifiche, credenziali ok.
 allow_credentials = False if use_wildcard else True
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if use_wildcard else allow_origins,
-    allow_origin_regex=allow_origin_regex,  # opzionale
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -181,8 +179,8 @@ def root():
 
 @app.get("/env-cors")
 def env_cors():
-    # utile per verificare cosa legge il container
-    return {"ALLOWED_ORIGINS_raw": ALLOWED_ORIGINS, "parsed": allow_origins, "credentials": allow_credentials}
+    return {"ALLOWED_ORIGINS_raw": os.getenv("ALLOWED_ORIGINS", "*"),
+            "parsed": allow_origins, "credentials": allow_credentials}
 
 # --- API principali ---
 @app.post("/predict")
@@ -194,6 +192,11 @@ async def predict(
     apply_prefilters: Optional[bool] = Form(default=None),
     window_sec: Optional[int] = Form(default=None),
 ):
+    # Se predict è chiamata direttamente (non via HTTP), i parametri possono essere oggetti Form → normalizza a None
+    if isinstance(social_mode, fastapi_params.Form):       social_mode = None
+    if isinstance(apply_prefilters, fastapi_params.Form):  apply_prefilters = None
+    if isinstance(window_sec, fastapi_params.Form):        window_sec = None
+
     if not file and not url:
         raise HTTPException(status_code=400, detail="Provide 'file' or 'url'.")
 
@@ -244,18 +247,32 @@ async def predict(
             except Exception:
                 pass
 
-# Alias retro-compatibili
+# Alias retro-compatibili — passano esplicitamente i parametri opzionali a None
 @app.post("/analyze")
 async def analyze_alias(
     file: Optional[UploadFile] = File(default=None),
     url: Optional[str] = Form(default=None),
     cookies_b64: Optional[str] = Form(default=None),
 ):
-    return await predict(file=file, url=url, cookies_b64=cookies_b64)
+    return await predict(
+        file=file,
+        url=url,
+        cookies_b64=cookies_b64,
+        social_mode=None,
+        apply_prefilters=None,
+        window_sec=None,
+    )
 
 @app.post("/analyze-url")
 async def analyze_url(
     url: str = Form(...),
     cookies_b64: Optional[str] = Form(default=None),
 ):
-    return await predict(file=None, url=url, cookies_b64=cookies_b64)
+    return await predict(
+        file=None,
+        url=url,
+        cookies_b64=cookies_b64,
+        social_mode=None,
+        apply_prefilters=None,
+        window_sec=None,
+    )
