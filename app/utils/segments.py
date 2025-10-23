@@ -1,8 +1,5 @@
 from typing import List, Tuple, Optional, Callable, Dict
-import cv2
-import numpy as np
 
-# Crea finestre [t_start, t_end) di dimensione window_sec, senza sovrapposizione
 def make_segments(total_duration: float, window_sec: int = 3) -> List[Tuple[float, float]]:
     if total_duration <= 0 or window_sec <= 0:
         return []
@@ -15,12 +12,15 @@ def make_segments(total_duration: float, window_sec: int = 3) -> List[Tuple[floa
         segs.append((0.0, min(total_duration, float(window_sec))))
     return segs
 
-# Analisi rapida su finestre: estrai pochi frame equidistanti per finestra,
-# applica prefilter opzionale e calcola 2 semplici indici (blur + blockiness)
-# -> questi NON sostituiscono i tuoi detectors; servono come diagnostica nel JSON.
 def analyze_segments(path: str,
                      segments: List[Tuple[float, float]],
                      prefilter_fn: Optional[Callable] = None) -> List[Dict]:
+    try:
+        import cv2  # lazy
+        import numpy as np
+    except Exception:
+        return []
+
     if not segments:
         return []
 
@@ -34,7 +34,6 @@ def analyze_segments(path: str,
 
     results = []
     for (ts, te) in segments:
-        # 3 campioni per finestra
         at = []
         for frac in (0.2, 0.5, 0.8):
             t_pick = ts + (te - ts) * frac
@@ -49,14 +48,11 @@ def analyze_segments(path: str,
                     frame = prefilter_fn(frame)
                 except Exception:
                     pass
-            at.append(_quick_metrics(frame))
+            at.append(_quick_metrics(frame, cv2, np))
 
         if at:
-            # media dei campioni
             blur = float(np.mean([x["blur"] for x in at]))
             block = float(np.mean([x["blockiness"] for x in at]))
-            # euristica per un mini-score “frame_artifacts_like”
-            # (solo diagnostico: non influisce sull'ai_score globale)
             est = max(0.0, min(1.0, 0.5 + 0.15 * (block - 0.5) - 0.1 * (blur - 0.5)))
         else:
             blur, block, est = 0.5, 0.5, 0.5
@@ -72,15 +68,12 @@ def analyze_segments(path: str,
     cap.release()
     return results
 
-def _quick_metrics(frame_bgr) -> Dict[str, float]:
-    # blur: Varianza del Laplaciano (normalizzata)
+def _quick_metrics(frame_bgr, cv2, np) -> Dict[str, float]:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     var_lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     blur = _norm(var_lap, lo=50, hi=600)
 
-    # blockiness: differenze medie sui confini 8x8 (proxy JPEG/MPEG)
     h, w = gray.shape
-    # bordi verticali ogni 8 px
     diffs = []
     for x in range(8, w, 8):
         col1 = gray[:, x-1].astype(np.float32)
