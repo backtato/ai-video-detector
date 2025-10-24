@@ -1,12 +1,33 @@
-.git
-__pycache__
+# Python
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.log
+*.sqlite3
+
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Env / IDE
 .env
 .venv
-.vscode
-.idea
-dist
-build
+venv/
+.env.local
+*.code-workspace
+.vscode/
+.idea/
+
+# Build / cache
+dist/
+build/
+*.egg-info/
+.eggs/
+.cache/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
