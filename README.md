@@ -1,22 +1,22 @@
-# AI-Video Detector (FastAPI)
+# AI-Video Detector (FastAPI + Gunicorn)
 
-Backend FastAPI + Gunicorn per stimare la plausibilità che un video sia generato da AI.
+Backend per stimare se un video è **reale / parzialmente AI / AI**, con output:
+- `ai_score` (0=molto reale … 1=molto AI)
+- `label` (Con alta probabilità è REALE / Esito incerto / Con alta probabilità è AI)
+- `timeline` con segmenti sospetti
+- metadati (`width/height/fps/duration/bit_rate/codec`) e piccoli check forensi
 
 ## Endpoints
 
-- `GET /healthz` → "ok"
-- `GET /predict-get?url=...` (alias `GET /predict`)  
-- `POST /predict` (form-data: `url` **oppure** `file`; opzionale `cookies_b64`)
-- `POST /analyze` (alias WP)  
-- `POST /analyze-url` (alias WP)
+- `GET /healthz` → `"ok"`
+- `POST /analyze` → upload file (`form-data: file=@video.*`)
+- `POST /analyze-url` → analizza link diretto a file video (`form-data: url=https://...`)
+  - blocca HLS `.m3u8` e HTML/login page
+  - social protetti (Instagram/TikTok ecc.): usa `USE_YTDLP=1` **con cookie**, oppure carica un file/registrazione schermo
+- `POST /predict` → retro-compatibile: accetta **`file` o `url`**
 
-Output (JSON):
-```json
-{
-  "ai_score": 0.51,
-  "confidence": 0.72,
-  "details": {
-    "parts": {"metadata": 0.50, "frame_artifacts": 0.54, "audio": 0.45},
-    "ffprobe": {...}
-  }
-}
+## Esempi `curl`
+
+Upload:
+```bash
+curl -sS -X POST "$BASE/analyze" -F "file=@/path/IMG_4568.mov" | jq
