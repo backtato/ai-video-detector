@@ -20,37 +20,37 @@ def audio_scores(wav_path: str, duration: float, window_sec: float=2.0) -> Tuple
             sr = wf.getframerate()
             nframes = wf.getnframes()
             if nframes <= 0:
-                # no audio
-                scores = [0.5]
-                tl = [{"start":0.0,"end":window_sec,"ai_score":0.5}]
-                return scores, tl
+                return [0.5],[{"start":0.0,"end":window_sec,"ai_score":0.5}]
             data = wf.readframes(nframes)
             x = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
     except Exception:
-        # problemi a leggere → neutro
         return [0.5],[{"start":0.0,"end":window_sec,"ai_score":0.5}]
 
     hop = int(sr * window_sec)
-    scores = []
-    timeline = []
+    scores, timeline = [], []
     pos = 0
     t = 0.0
+    global_energy = float((x**2).mean()) if x.size else 0.0
+
     while pos < len(x):
         seg = x[pos:pos+hop]
         if seg.size == 0: break
         zcr = _zero_crossing_rate(seg)
         flat = _spectral_flatness(seg)
         energy = float((seg**2).mean())
-        # Heuristic: audio “troppo pulito/artefatto” → punteggio più alto
+
         # normalizzazioni blande
         zcr_n = np.clip(zcr / 0.2, 0.0, 1.0)
-        flat_n = flat  # già 0..1
+        flat_n = flat
         energy_n = np.clip(energy / 0.01, 0.0, 1.0)
+
         score = float(np.clip(0.5*flat_n + 0.3*zcr_n + 0.2*(1.0 - energy_n), 0.0, 1.0))
-        # Micro-bias: se c'è segnale (energia) e il punteggio è praticamente neutro,
+
+        # Micro-bias: se c'è segnale e il punteggio è praticamente neutro,
         # spostalo leggermente verso "reale" per dare informazione alla fusione.
-        if energy > 1e-4 and abs(score - 0.5) < 0.02:
+        if global_energy > 1e-5 and abs(score - 0.5) < 0.02:
             score = 0.45
+
         scores.append(score)
         timeline.append({"start": float(t), "end": float(t+window_sec), "ai_score": score})
         pos += hop
