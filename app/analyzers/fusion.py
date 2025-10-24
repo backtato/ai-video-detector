@@ -2,12 +2,23 @@ from typing import List, Dict, Any
 import numpy as np
 import math
 
+NEUTRAL = 0.5
+EPS = 0.02  # finestra di neutralità: [0.48, 0.52]
+
 def _safe_avg(xs: List[float]) -> float:
     if not xs: return 0.5
     return float(np.clip(np.mean(xs), 0.0, 1.0))
 
+def _is_neutral(v: float) -> bool:
+    return abs(v - NEUTRAL) <= EPS
+
 def _bin_timeline(timeline: List[dict], duration: float, bin_sec: float = 1.0, mode: str = "max") -> List[dict]:
-    if duration <= 0: duration = max([seg["end"] for seg in timeline] + [0.0])
+    """
+    Aggrega la timeline per secondi, ignorando i valori 'neutri' (≈0.5±0.02).
+    Se in un bin restano solo valori neutri → 0.5.
+    """
+    if duration <= 0:
+        duration = max([seg["end"] for seg in timeline] + [0.0])
     bins = []
     nbins = max(int(math.ceil(duration / bin_sec)), 1)
     for i in range(nbins):
@@ -17,17 +28,22 @@ def _bin_timeline(timeline: List[dict], duration: float, bin_sec: float = 1.0, m
         for seg in timeline:
             # overlap?
             if seg["end"] > start and seg["start"] < end:
-                vals.append(seg["ai_score"])
+                v = float(seg["ai_score"])
+                if not _is_neutral(v):
+                    vals.append(v)
         if not vals:
-            score = 0.5
+            score = NEUTRAL
         else:
             score = max(vals) if mode == "max" else float(np.mean(vals))
         bins.append({"start": float(start), "end": float(end), "ai_score": float(np.clip(score, 0.0, 1.0))})
     return bins
 
-def _top_peaks(bins: List[dict], k: int = 3) -> List[dict]:
-    # restituisce i k bin con ai_score più alto
-    order = sorted(bins, key=lambda b: b["ai_score"], reverse=True)
+def _top_peaks(bins: List[dict], k: int = 3, min_score: float = 0.55) -> List[dict]:
+    """
+    Ritorna i k bin con ai_score più alto, escludendo i neutrali e quelli sotto min_score.
+    """
+    candidates = [b for b in bins if (not _is_neutral(b["ai_score"])) and b["ai_score"] >= min_score]
+    order = sorted(candidates, key=lambda b: b["ai_score"], reverse=True)
     return order[:k]
 
 def fuse_and_label(meta: Dict[str,Any],
@@ -49,10 +65,10 @@ def fuse_and_label(meta: Dict[str,Any],
     timeline.extend(a_timeline)
     timeline = sorted(timeline, key=lambda s: (s["start"], s["end"]))
 
-    # timeline binned a 1s per la UI
+    # timeline binned a 1s per UI (ignorando i neutrali)
     duration = float(meta.get("duration") or 0.0)
     timeline_binned = _bin_timeline(timeline, duration, bin_sec=1.0, mode="max")
-    peaks = _top_peaks(timeline_binned, k=3)
+    peaks = _top_peaks(timeline_binned, k=3, min_score=0.55)
 
     # soglie conservative
     if ai_score < 0.35: label = "Con alta probabilità è REALE"; conf = 0.7
@@ -81,9 +97,9 @@ def fuse_and_label(meta: Dict[str,Any],
             "label": label,
             "confidence": conf
         },
-        # tieni anche la timeline dettagliata per debug
+        # timeline dettagliata per debug
         "timeline": timeline,
-        # aggiunte UI-friendly
+        # UI-friendly
         "timeline_binned": timeline_binned,
         "peaks": peaks
     }
