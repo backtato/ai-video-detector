@@ -2,34 +2,21 @@ services:
   - type: web
     name: ai-video-detector
     env: docker
-    plan: starter
-    autoDeploy: true
+    plan: free
     healthCheckPath: /healthz
+    autoDeploy: true
     envVars:
-      # CORS / Frontend
-      - key: FRONTEND_ORIGIN
-        value: "https://greensovereignfund.ch"
       - key: ALLOWED_ORIGINS
-        value: "https://greensovereignfund.ch,https://www.greensovereignfund.ch"
-
-      # Limiti/timeout
+        sync: false
       - key: MAX_UPLOAD_BYTES
-        value: "52428800"   # 50MB
+        value: "52428800"
       - key: RESOLVER_MAX_BYTES
-        value: "125829120"  # 120MB
-      - key: CONNECT_TIMEOUT
-        value: "6.0"
-      - key: READ_TIMEOUT
-        value: "15.0"
-
-      # Resolver Social (opzionale)
-      - key: USE_YTDLP
-        value: "0"          # metti "1" se vuoi attivare yt-dlp
-      - key: YTDLP_COOKIES
-        value: ""           # es: /app/cookies.txt se monti cookie
-
-      # Gunicorn
-      - key: WEB_CONCURRENCY
-        value: "2"
-      - key: WORKER_TIMEOUT
+        value: "125829120"
+      - key: REQUEST_TIMEOUT_S
         value: "120"
+      - key: USE_YTDLP
+        value: "1"
+      - key: RESOLVER_UA
+        value: "Mozilla/5.0 (AVD/1.0; +https://ai-video.org)"
+      - key: YTDLP_OPTS
+        value: '{"noplaylist":true,"continuedl":false,"retries":1}'
