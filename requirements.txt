@@ -1,19 +1,8 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-gunicorn==22.0.0
-starlette==0.38.5
-pydantic==2.9.2
+fastapi==0.110.0
+uvicorn==0.29.0
+gunicorn==21.2.0
+requests==2.32.3
 
+# ANALISI
 numpy==1.26.4
 opencv-python-headless==4.10.0.84
-
-opencv-python-headless==4.10.0.84
-numpy==2.1.2
-
-# Necessario per File(...) e Form(...) in FastAPI
-python-multipart==0.0.9
-
-# Resolver
-yt-dlp
-requests>=2.32.3
-aiofiles==24.1.0
