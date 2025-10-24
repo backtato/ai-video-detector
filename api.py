@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -44,8 +44,7 @@ ALLOWED_ORIGINS = [
     if o.strip()
 ]
 if not ALLOWED_ORIGINS:
-    # fallback permissivo per sviluppo – in produzione imposta ALLOWED_ORIGINS
-    ALLOWED_ORIGINS = ["*"]
+    ALLOWED_ORIGINS = ["*"]  # dev fallback
 
 # UA per le richieste HTTP
 RESOLVER_UA = os.getenv(
@@ -69,11 +68,12 @@ DEFAULT_YTDLP_OPTS = {
 
 # Domini consentiti per i link
 ALLOW_DOMAINS = set([
-    "youtube.com", "youtu.be", "vimeo.com",
+    "youtube.com", "www.youtube.com", "youtu.be",
+    "vimeo.com", "www.vimeo.com",
     "instagram.com", "www.instagram.com",
     "tiktok.com", "www.tiktok.com",
     "facebook.com", "www.facebook.com", "fb.watch",
-    "x.com", "twitter.com", "www.twitter.com",
+    "x.com", "www.x.com", "twitter.com", "www.twitter.com",
 ])
 # Estensioni file video accettate (download diretto)
 ALLOW_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mpg", ".mpeg", ".avi")
@@ -108,7 +108,7 @@ def _domain_allowed(u: str) -> bool:
     try:
         host = urlparse(u).netloc.lower()
         # consenti anche CDN di file diretti
-        if any(host.endswith(d) for d in ALLOW_DOMAINS):
+        if any(host.endswith(d) for d in ALLOW_DOMAINS) or host in ALLOW_DOMAINS:
             return True
         # se è un URL diretto con estensione video, consenti
         path = urlparse(u).path.lower()
@@ -127,7 +127,6 @@ def _tmpfile(suffix: str = "") -> str:
     return path
 
 def _probe_metadata(path: str) -> dict:
-    """Estrae width/height/fps via OpenCV se disponibile."""
     meta = {"width": None, "height": None, "fps": None}
     if not HAS_CV2:
         return meta
@@ -143,15 +142,11 @@ def _probe_metadata(path: str) -> dict:
     return meta
 
 def _basic_analyze(path: str) -> dict:
-    """Baseline analyzer: restituisce struttura UI-friendly.
-    Integrazioni future possono sostituire questa funzione.
-    """
     video_meta = _probe_metadata(path)
-    # Placeholder neutro e conservativo per evitare falsi positivi
     result = {
-        "label": "uncertain",
-        "ai_score": 0.50,        # 0..1 (alto = più probabile AI)
-        "confidence": 0.50,      # 0..1
+        "label": "uncertain",   # baseline conservativa
+        "ai_score": 0.50,
+        "confidence": 0.50,
     }
     return {
         "result": result,
@@ -162,7 +157,6 @@ def _basic_analyze(path: str) -> dict:
     }
 
 def _save_upload_to_tmp(upload: UploadFile) -> str:
-    # controllo dimensione (se disponibile da header)
     size = 0
     tmp_path = _tmpfile(suffix=os.path.splitext(upload.filename or "")[1] or ".bin")
     with open(tmp_path, "wb") as out:
@@ -177,7 +171,6 @@ def _save_upload_to_tmp(upload: UploadFile) -> str:
                 except Exception: pass
                 _raise_422(f"File troppo grande (> {MAX_UPLOAD_BYTES} bytes)")
             out.write(chunk)
-    # reset stream
     try:
         upload.file.close()
     except Exception:
@@ -185,9 +178,7 @@ def _save_upload_to_tmp(upload: UploadFile) -> str:
     return tmp_path
 
 def _download_direct(url: str) -> Tuple[str, Optional[str]]:
-    """Prova a scaricare direttamente se è un file video servito come asset."""
     with requests.Session() as s:
-        # HEAD per ispezionare headers
         try:
             h = s.head(url, headers=_http_headers(), allow_redirects=True, timeout=REQUEST_TIMEOUT_S)
         except Exception as e:
@@ -198,18 +189,15 @@ def _download_direct(url: str) -> Tuple[str, Optional[str]]:
         if cl and cl > RESOLVER_MAX_BYTES:
             _raise_422("Il file remoto è troppo grande. Usa 'Registra 15s' o 'Carica file'.")
 
-        # Se è chiaramente HTML, non è un asset diretto
         if "text/html" in ctype:
             _raise_422("Not a direct video (text/html). Usa 'Carica file' o 'Registra 15s'.")
 
-        # Prova il GET (stream) con limite
         try:
             r = s.get(url, headers=_http_headers(), stream=True, timeout=REQUEST_TIMEOUT_S)
             r.raise_for_status()
         except Exception as e:
             _raise_422(f"Errore download: {e}")
 
-        # Estensione da url o da content-type
         ext = os.path.splitext(urlparse(r.url).path)[1].lower()
         if not ext:
             if "mp4" in ctype: ext = ".mp4"
@@ -234,12 +222,10 @@ def _download_direct(url: str) -> Tuple[str, Optional[str]]:
     return tmp_path, ctype or None
 
 def _ytdlp_resolve_and_download(url: str) -> str:
-    """Usa yt-dlp per ottenere il 'miglior' video pubblico e scaricarlo in tmp."""
     if not HAS_YTDLP:
         _raise_422("yt-dlp non disponibile nel server.")
 
     opts = {**DEFAULT_YTDLP_OPTS, **YTDLP_OPTS}
-    # Qui scarichiamo in un temp dir
     tmpdir = tempfile.mkdtemp()
     outtmpl = os.path.join(tmpdir, "%(title).80s.%(ext)s")
     opts.update({
@@ -248,7 +234,7 @@ def _ytdlp_resolve_and_download(url: str) -> str:
         "nopart": True,
         "ignoreerrors": False,
         "user_agent": RESOLVER_UA,
-        "merge_output_format": "mp4",  # se serve
+        "merge_output_format": "mp4",
     })
 
     try:
@@ -256,27 +242,22 @@ def _ytdlp_resolve_and_download(url: str) -> str:
             info = ydl.extract_info(url, download=True)
             if not info:
                 _raise_422("Impossibile estrarre il video (yt-dlp).")
-            # Normalizza path del file scaricato (singolo video)
             if "requested_downloads" in info and info["requested_downloads"]:
                 fpath = info["requested_downloads"][0]["filepath"]
             else:
-                # fallback: prova a comporre dal template
                 title = info.get("title", "video")
                 ext = info.get("ext", "mp4")
                 fpath = os.path.join(tmpdir, f"{title}.{ext}")
             if not os.path.exists(fpath):
-                # come extrema ratio, prendi il primo file nel tmpdir
                 cand = [os.path.join(tmpdir, p) for p in os.listdir(tmpdir)]
                 cand = [p for p in cand if os.path.isfile(p)]
                 if not cand:
                     _raise_422("Download non riuscito (yt-dlp).")
                 fpath = sorted(cand, key=lambda p: -os.path.getsize(p))[0]
-            # Se supera il nostro limite hard, scarta
             if os.path.getsize(fpath) > RESOLVER_MAX_BYTES:
                 try: shutil.rmtree(tmpdir)
                 except Exception: pass
                 _raise_422("File troppo grande dal provider. Usa 'Registra 15s' o 'Carica file'.")
-            # Sposta in file tmp definitivo
             suffix = os.path.splitext(fpath)[1] or ".mp4"
             final_path = _tmpfile(suffix=suffix)
             shutil.move(fpath, final_path)
@@ -284,13 +265,11 @@ def _ytdlp_resolve_and_download(url: str) -> str:
             except Exception: pass
             return final_path
     except Exception as e:
-        # Messaggi noti: login required / rate-limit
         msg = str(e)
         if "login" in msg.lower() and "require" in msg.lower():
             _raise_422("DownloadError yt-dlp: login required / contenuto non pubblico")
         if "rate" in msg.lower() and "limit" in msg.lower():
             _raise_422("DownloadError yt-dlp: rate-limit reached dal provider")
-        # generico
         _raise_422(f"DownloadError yt-dlp: {msg}")
 
 # =========================
@@ -302,7 +281,6 @@ def healthz():
 
 @app.post("/analyze")
 def analyze(file: UploadFile = File(...)):
-    """Analizza un file caricato."""
     if not file:
         _raise_422("Nessun file fornito.")
     try:
@@ -318,41 +296,45 @@ def analyze(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Errore interno: {e}")
 
 @app.post("/analyze-url")
-def analyze_url(url: str = Form(None), payload: Optional[dict] = None):
-    """Analizza un URL (atteso JSON {url:...} oppure form field 'url')."""
-    # Supporta application/json {url:"..."}
-    if payload and isinstance(payload, dict) and "url" in payload:
-        url_in = payload.get("url")
-    else:
-        # Se inviato come JSON puro
-        # FastAPI mappa automaticamente il body in param 'payload', ma preferiamo leggere raw
+async def analyze_url(request: Request):
+    """
+    Analizza un URL. Accetta:
+    - JSON:        { "url": "https://..." }
+    - form-data:   url=<...>
+    - x-www-form-urlencoded: url=<...>
+    """
+    url_in: Optional[str] = None
+
+    # 1) prova JSON
+    try:
+        data = await request.json()
+        if isinstance(data, dict) and "url" in data:
+            url_in = str(data.get("url", "")).strip()
+    except Exception:
+        pass
+
+    # 2) prova form (multipart o urlencoded)
+    if not url_in:
         try:
-            from fastapi import Request  # lazy
-            # NOTA: FastAPI non consente due body parser diversi in una singola sig.
-            # Lascio compat: se 'url' non arriva come Form, leggiamo sincronicamente la var env.
+            form = await request.form()
+            if "url" in form:
+                url_in = str(form.get("url", "")).strip()
         except Exception:
             pass
-        url_in = url
+
+    # 3) ultima spiaggia: querystring ?url=
+    if not url_in:
+        url_in = str(request.query_params.get("url", "")).strip()
 
     if not url_in:
-        # prova a leggere dal body JSON manualmente (retro-compat)
-        from starlette.requests import Request
-        import anyio
-        async def _read_json():
-            scope = app.router.default
-            return {}
-        # più semplice: errore chiaro
         _raise_422("Campo 'url' mancante.")
 
-    url_in = str(url_in).strip()
     if not _is_url(url_in):
         _raise_422("URL non valido.")
 
-    # Se non è dominio consentito e non è asset video diretto, rifiuta
     parsed = urlparse(url_in)
     host = parsed.netloc.lower()
     path = parsed.path.lower()
-
     is_direct = any(path.endswith(ext) for ext in ALLOW_EXTS)
 
     if (host not in ALLOW_DOMAINS) and (not is_direct):
@@ -360,10 +342,8 @@ def analyze_url(url: str = Form(None), payload: Optional[dict] = None):
 
     try:
         if is_direct:
-            # asset diretto
-            tmp_path, ctype = _download_direct(url_in)
+            tmp_path, _ctype = _download_direct(url_in)
         else:
-            # social provider → prova yt-dlp se abilitato
             if not USE_YTDLP:
                 _raise_422("Richiede estrazione dal provider. Attiva USE_YTDLP o usa 'Carica file'/'Registra 15s'.")
             tmp_path = _ytdlp_resolve_and_download(url_in)
@@ -381,14 +361,16 @@ def analyze_url(url: str = Form(None), payload: Optional[dict] = None):
 
 @app.post("/predict")
 def predict(file: UploadFile = File(None), url: Optional[str] = Form(None)):
-    """Retro-compat: accetta file OPPURE url e delega alle route nuove."""
     if file is not None:
         return analyze(file=file)
     if url:
-        return analyze_url(url=url)
+        # delega a analyze_url simulando una richiesta form
+        scope = {"type": "http"}
+        from starlette.requests import Request as StarletteRequest
+        req = StarletteRequest(scope)
+        # Non possiamo realmente passare il body qui; ritorna mess. chiaro:
+        _raise_422("Usa /analyze-url (JSON {url} o form) o /analyze con file.")
     _raise_422("Fornire 'file' oppure 'url'.")
 
-# =========================
-# Run (sviluppo)
-# =========================
-# Esempio: uvicorn api:app --host 0.0.0.0 --port 8000
+# Run locale:
+# uvicorn api:app --host 0.0.0.0 --port 8000
