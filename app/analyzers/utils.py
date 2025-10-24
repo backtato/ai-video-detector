@@ -1,0 +1,1 @@
+# Placeholder per utility future (non usato ora)
