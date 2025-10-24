@@ -1,31 +1,12 @@
-# Python
-__pycache__/
+.git
+__pycache__
 *.pyc
 *.pyo
 *.pyd
-*.egg-info/
-.venv/
-venv/
+*.log
 .env
-.env.*
-.pytest_cache/
-.cache/
-
-# VCS
-.git/
-.gitignore
-.gitattributes
-
-# IDE
-.vscode/
-.idea/
-
-# OS junk
-.DS_Store
-Thumbs.db
-
-# Build/Dist
-build/
-dist/
-coverage/
-htmlcov/
+.venv
+.vscode
+.idea
+dist
+build
