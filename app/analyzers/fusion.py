@@ -1,105 +1,155 @@
-from typing import List, Dict, Any
+# app/fusion.py
+from typing import Dict, Any, List
 import numpy as np
-import math
 
-NEUTRAL = 0.5
-EPS = 0.02  # finestra di neutralità: [0.48, 0.52]
-
-def _safe_avg(xs: List[float]) -> float:
-    if not xs: return 0.5
-    return float(np.clip(np.mean(xs), 0.0, 1.0))
-
-def _is_neutral(v: float) -> bool:
-    return abs(v - NEUTRAL) <= EPS
+def _safe(v, d=0.5):
+    try:
+        if v is None: return d
+        return float(v)
+    except Exception:
+        return d
 
 def _bin_timeline(timeline: List[dict], duration: float, bin_sec: float = 1.0, mode: str = "max") -> List[dict]:
     """
-    Aggrega la timeline per secondi, ignorando i valori 'neutri' (≈0.5±0.02).
-    Se in un bin restano solo valori neutri → 0.5.
+    Binning temporale semplice di una timeline [{start,end,ai_score}].
     """
-    if duration <= 0:
-        duration = max([seg["end"] for seg in timeline] + [0.0])
+    if not timeline:
+        if duration and duration > 0:
+            return [{"start": 0.0, "end": min(duration, 1.0), "ai_score": 0.5}]
+        return [{"start": 0.0, "end": 1.0, "ai_score": 0.5}]
+
+    if not duration or duration <= 0:
+        duration = max([seg.get("end", 0.0) for seg in timeline] + [1.0])
+
     bins = []
-    nbins = max(int(math.ceil(duration / bin_sec)), 1)
-    for i in range(nbins):
-        start = i * bin_sec
-        end = min((i + 1) * bin_sec, duration)
+    t = 0.0
+    while t < duration:
+        te = min(t + bin_sec, duration)
+        # prendere max (o media) dei segmenti che intersecano [t, te]
         vals = []
         for seg in timeline:
-            # overlap?
-            if seg["end"] > start and seg["start"] < end:
-                v = float(seg["ai_score"])
-                if not _is_neutral(v):
-                    vals.append(v)
+            s0, s1 = seg.get("start", 0.0), seg.get("end", 0.0)
+            if s1 <= t or s0 >= te:
+                continue
+            vals.append(float(seg.get("ai_score", 0.5)))
         if not vals:
-            score = NEUTRAL
-        else:
-            score = max(vals) if mode == "max" else float(np.mean(vals))
-        bins.append({"start": float(start), "end": float(end), "ai_score": float(np.clip(score, 0.0, 1.0))})
+            vals = [0.5]
+        bins.append({"start": float(t), "end": float(te), "ai_score": float(max(vals) if mode=="max" else np.mean(vals))})
+        t = te
     return bins
 
-def _top_peaks(bins: List[dict], k: int = 3, min_score: float = 0.55) -> List[dict]:
+def _dynamic_bin(bins: List[dict]) -> List[dict]:
     """
-    Ritorna i k bin con ai_score più alto, escludendo i neutrali e quelli sotto min_score.
+    Densifica i bin se la varianza locale è alta (>0.05).
+    Semplice: spezza in due i bin con (ai_score dev) > soglia.
     """
-    candidates = [b for b in bins if (not _is_neutral(b["ai_score"])) and b["ai_score"] >= min_score]
-    order = sorted(candidates, key=lambda b: b["ai_score"], reverse=True)
-    return order[:k]
+    if not bins:
+        return bins
+    out: List[dict] = []
+    for b in bins:
+        score = _safe(b.get("ai_score"), 0.5)
+        if abs(score - 0.5) > 0.05 and (b["end"] - b["start"]) > 1.0:
+            mid = (b["start"] + b["end"]) / 2.0
+            out.append({"start": b["start"], "end": mid, "ai_score": score})
+            out.append({"start": mid, "end": b["end"], "ai_score": score})
+        else:
+            out.append(b)
+    return out
 
-def fuse_and_label(meta: Dict[str,Any],
-                   forensic: Dict[str,Any],
-                   v_scores: List[float], v_timeline: List[dict],
-                   a_scores: List[float], a_timeline: List[dict]) -> Dict[str,Any]:
-    # pesi base
-    w_video, w_audio = 0.6, 0.4
-    if a_timeline and len(a_timeline)==1 and a_timeline[0]["ai_score"]==0.5 and len(a_scores)==1:
-        w_video, w_audio = 0.8, 0.2
+def _peaks(bins: List[dict], min_dev: float = 0.15, min_coverage: float = 0.10) -> List[dict]:
+    """
+    Identifica segmenti con |score-0.5|>min_dev per >=10% di durata totale (regola semplificata).
+    """
+    if not bins: return []
+    total = sum(b["end"] - b["start"] for b in bins)
+    if total <= 0: return []
+    # Merge molto semplice di bin “alti”
+    high = [b for b in bins if abs(_safe(b["ai_score"],0.5)-0.5) > min_dev]
+    if not high: return []
+    # Accorpa contigui
+    peaks: List[dict] = []
+    cur = None
+    for b in high:
+        if cur is None:
+            cur = dict(b)
+        else:
+            if abs(b["start"] - cur["end"]) < 1e-6:
+                cur["end"] = b["end"]
+                cur["ai_score"] = max(cur["ai_score"], b["ai_score"])
+            else:
+                peaks.append(cur); cur = dict(b)
+    if cur: peaks.append(cur)
+    # Filtra per copertura
+    peaks = [p for p in peaks if (p["end"] - p["start"]) / total >= min_coverage]
+    return peaks
 
-    v_mean = _safe_avg(v_scores)
-    a_mean = _safe_avg(a_scores)
-    ai_score = float(np.clip(w_video*v_mean + w_audio*a_mean, 0.0, 1.0))
+def fuse_scores(frame: float, audio: float, hints: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fusione pesata + etichetta + confidenza e reason codes.
+    - ai_score = 0.6*frame + 0.3*audio + 0.1*hints_score
+    - label: <0.35 reale, 0.35–0.65 incerto, >0.65 AI
+    """
+    f = _safe(frame, 0.5)
+    a = _safe(audio, 0.5)
 
-    # timeline grezza (video + audio)
-    timeline = []
-    timeline.extend(v_timeline)
-    timeline.extend(a_timeline)
-    timeline = sorted(timeline, key=lambda s: (s["start"], s["end"]))
+    # Hints score semplice
+    hs = 0.5
+    reasons: List[str] = []
+    if hints.get("no_c2pa", False):
+        reasons.append("no_c2pa")
+        hs += 0.05
+    if hints.get("apple_quicktime_tags", False):
+        reasons.append("iphone_quicktime_tags")
+        hs -= 0.02
+    if hints.get("editor_like", False):
+        reasons.append("editing_software_tags")
+        hs += 0.05
+    if hints.get("low_motion", False):
+        reasons.append("low_motion")
+        hs += 0.03
+    hs = float(np.clip(hs, 0.0, 1.0))
 
-    # timeline binned a 1s per UI (ignorando i neutrali)
-    duration = float(meta.get("duration") or 0.0)
-    timeline_binned = _bin_timeline(timeline, duration, bin_sec=1.0, mode="max")
-    peaks = _top_peaks(timeline_binned, k=3, min_score=0.55)
+    ai_score = 0.6*f + 0.3*a + 0.1*hs
+    ai_score = float(np.clip(ai_score, 0.0, 1.0))
 
-    # soglie conservative
-    if ai_score < 0.35: label = "Con alta probabilità è REALE"; conf = 0.7
-    elif ai_score > 0.65: label = "Con alta probabilità è AI"; conf = 0.7
-    else: label = "Esito incerto / Parziale"; conf = 0.6
+    if ai_score < 0.35:
+        label = "real"
+    elif ai_score > 0.65:
+        label = "ai"
+    else:
+        label = "uncertain"
 
     return {
-        "ok": True,
-        "meta": {
-            "width": meta.get("width"),
-            "height": meta.get("height"),
-            "fps": meta.get("fps"),
-            "duration": duration,
-            "bit_rate": meta.get("bit_rate"),
-            "vcodec": meta.get("vcodec"),
-            "acodec": meta.get("acodec"),
-            "format_name": meta.get("format_name"),
-        },
-        "forensic": forensic,
-        "scores": {
-            "frame": v_mean,
-            "audio": a_mean
-        },
-        "fusion": {
-            "ai_score": ai_score,
-            "label": label,
-            "confidence": conf
-        },
-        # timeline dettagliata per debug
-        "timeline": timeline,
-        # UI-friendly
-        "timeline_binned": timeline_binned,
-        "peaks": peaks
+        "ai_score": ai_score,
+        "label": label,
+        "reasons": reasons
     }
+
+def finalize_with_timeline(fusion_core: Dict[str, Any], bins: List[dict]) -> Dict[str, Any]:
+    """
+    Aggiunge confidenza e calcola peaks dalla timeline binned.
+    """
+    if not bins:
+        conf = 0.5
+        peaks = []
+    else:
+        vals = [float(b["ai_score"]) for b in bins]
+        stdev = float(np.std(vals)) if vals else 0.0
+        conf = float(np.clip(1.0 - stdev, 0.0, 1.0))
+        peaks = _peaks(bins, min_dev=0.15, min_coverage=0.10)
+
+    out = dict(fusion_core)
+    out["confidence"] = conf
+    return out, peaks
+
+def build_hints(meta: Dict[str, Any], video_flags: List[str], c2pa_present: bool, dev_fingerprint: Dict[str,Any]) -> Dict[str, Any]:
+    """
+    Converte meta/flags in un dizionario di hint booleani.
+    """
+    hints = {
+        "no_c2pa": not bool(c2pa_present),
+        "apple_quicktime_tags": bool(dev_fingerprint.get("apple_quicktime_tags")),
+        "editor_like": bool(dev_fingerprint.get("editor_like")),
+        "low_motion": "low_motion" in (video_flags or []),
+    }
+    return hints
