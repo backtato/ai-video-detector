@@ -1,34 +1,27 @@
 # Dockerfile
 FROM python:3.11-slim
 
-# Evita prompt interattivi e riduce warnings
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PYTHONUNBUFFERED=1
 
-# Dipendenze di sistema minime per yt-dlp/opencv + ffmpeg per eventuali merge
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    ca-certificates \
+    ffmpeg exiftool tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
-# Workdir
 WORKDIR /app
 
-# Requirements prima per massimizzare layer caching
+# Requirements first (per layer cache)
 COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copia codice
+# App
 COPY . /app
 
-# Healthcheck (FastAPI /healthz)
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()" || exit 1
+# Porta/healthcheck
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
 
-# Avvio con Gunicorn + UvicornWorker
-CMD ["gunicorn", "api:app", "-k", "uvicorn.workers.UvicornWorker", "-c", "gunicorn_conf.py"]
+# Gunicorn + Uvicorn worker
+CMD ["gunicorn", "-c", "gunicorn_conf.py", "api:app"]
