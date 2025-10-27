@@ -1,20 +1,20 @@
 FROM python:3.11-slim
 
+LABEL author="Backtato"  # NEW
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# System deps
+# System deps (valuta se rimuovere tesseract-ocr se non usato)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg exiftool tesseract-ocr curl ca-certificates \
+    ffmpeg exiftool curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Requirements first
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# App
 COPY . /app
 
 EXPOSE 8000
