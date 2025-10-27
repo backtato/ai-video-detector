@@ -1,11 +1,11 @@
 FROM python:3.11-slim
 
-LABEL author="Backtato"  # NEW
+# Autore del progetto
+LABEL author="Backtato"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# System deps (valuta se rimuovere tesseract-ocr se non usato)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg exiftool curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY . /app
 
 EXPOSE 8000
+
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
 
