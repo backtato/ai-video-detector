@@ -1,5 +1,5 @@
 # AI-Video Detector (FastAPI + Gunicorn)
-**Author:** Backtato
+## Author: Backtato
 
 - Limite upload configurabile via `MAX_UPLOAD_BYTES` (default **100 MB**).
 - Localizzazione automatica via `Accept-Language` / `X-Lang` / `?lang=`.
