@@ -1,26 +1,27 @@
-# AI-Video Detector (FastAPI + Gunicorn)
-## Author: Backtato
+FROM python:3.11-slim
 
-- Limite upload configurabile via `MAX_UPLOAD_BYTES` (default **100 MB**).
-- Localizzazione automatica via `Accept-Language` / `X-Lang` / `?lang=`.
+# === Meta informazioni ===
+LABEL maintainer="Backtato"
+LABEL author="Backtato"
 
-Backend per stimare se un video è **reale / parzialmente AI / AI**, con output:
-- `ai_score` (0=molto reale … 1=molto AI)
-- `label` (Con alta probabilità è REALE / Esito incerto / Con alta probabilità è AI)
-- `timeline` con segmenti sospetti
-- metadati (`width/height/fps/duration/bit_rate/codec`) e piccoli check forensi
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-## Endpoints
+# System deps (valuta se rimuovere tesseract se non usato)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg exiftool curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-- `GET /healthz` → `"ok"`
-- `POST /analyze` → upload file (`form-data: file=@video.*`)
-- `POST /analyze-url` → analizza link diretto a file video (`form-data: url=https://...`)
-  - blocca HLS `.m3u8` e HTML/login page
-  - social protetti (Instagram/TikTok ecc.): usa `USE_YTDLP=1` **con cookie**, oppure carica un file/registrazione schermo
-- `POST /predict` → retro-compatibile: accetta **`file` o `url`**
+WORKDIR /app
 
-## Esempi `curl`
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-Upload:
-```bash
-curl -sS -X POST "$BASE/analyze" -F "file=@/path/IMG_4568.mov" | jq
+COPY . /app
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
+
+CMD ["gunicorn", "-c", "gunicorn_conf.py", "api:app"]
