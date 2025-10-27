@@ -1,4 +1,8 @@
 # AI-Video Detector (FastAPI + Gunicorn)
+**Author:** Backtato
+
+- Limite upload configurabile via `MAX_UPLOAD_BYTES` (default **100 MB**).
+- Localizzazione automatica via `Accept-Language` / `X-Lang` / `?lang=`.
 
 Backend per stimare se un video è **reale / parzialmente AI / AI**, con output:
 - `ai_score` (0=molto reale … 1=molto AI)
