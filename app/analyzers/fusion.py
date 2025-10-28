@@ -30,31 +30,27 @@ def _compress_index(meta: Dict[str, Any], video_stats: Dict[str, Any]) -> Tuple[
     if width and height and fps and br:
         mpf = (width*height)/1_000_000.0
         br_per_frame = br / max(fps,1.0)
-        norm = br_per_frame / max(mpf, 0.1)  # kbit/s per MP per frame (scala grossolana)
-        # soglie grezze per “molto compresso”
-        if norm < 20000:   # molto basso
+        norm = br_per_frame / max(mpf, 0.1)
+        if norm < 20000:
             c = 0.85
-        elif norm < 40000: # basso
+        elif norm < 40000:
             c = 0.65
-        elif norm < 80000: # medio
+        elif norm < 80000:
             c = 0.35
         else:
             c = 0.15
     else:
         c = 0.50  # ignoto → prudente
 
-    # duplicate frames spingono compressione percepita
     dup = float(dup or 0.0)
     if dup >= 0.5:
         c = max(c, 0.8); notes["duplicate_frames"] = "Molti frame duplicati."
     elif dup >= 0.25:
         c = max(c, 0.6); notes["duplicate_frames"] = "Frame duplicati moderati."
 
-    # fps molto basso
     if fps and fps < 18.0:
         c = max(c, 0.65); notes["low_fps"] = "Frame rate basso."
 
-    # annotazioni sintetiche
     if c >= 0.75:
         notes["heavy_compression"] = "Compressione forte/WhatsApp-like."
     elif c >= 0.5:
@@ -85,41 +81,32 @@ def fuse(video_stats: Dict[str, Any], audio_stats: Dict[str, Any], meta: Dict[st
     a = audio_stats or {}
     m = meta or {}
 
-    # Timeline lunghezza (per-secondo)
     duration = _safe_get(m, ["meta","duration"], _safe_get(m, ["duration"], 0.0)) or 0.0
     n_bins   = max(int(duration)+1, 1)
 
     video_tl = _align_bins(n_bins, _safe_get(v, ["timeline","ai_score"], []))
     audio_tl = _align_bins(n_bins, _safe_get(a, ["timeline","ai_score"], []))
 
-    # score medi
     v_mean = float(_safe_get(v, ["summary","ai_score_mean"], 0.5))
-    a_mean = float(_safe_get(a, ["scores","tts_like"], 0.5))  # audio “verso AI”: più alto = più AI-like
+    a_mean = float(_safe_get(a, ["scores","tts_like"], 0.5))
 
-    # compressione
     comp_idx, comp_notes = _compress_index(m, v)
 
-    # fusione frame-wise
     fused = []
     for i in range(n_bins):
-        base = 0.65*audio_tl[i] + 0.25*video_tl[i] + 0.10*(audio_tl[i]-0.5) + 0.50  # re-centering
+        base = 0.65*audio_tl[i] + 0.25*video_tl[i] + 0.10*(audio_tl[i]-0.5) + 0.50
         base = _clamp(base, 0.0, 1.0)
-        # attenuazione compressione → pull verso 0.5
         pull = 0.05 + 0.05 * (1.0 if comp_idx >= 0.75 else (0.5 if comp_idx >= 0.5 else 0.0))
         base = 0.5 + (base - 0.5) * (1.0 - pull)
         fused.append(_clamp(base))
 
-    # score globale = media robusta
     ai_score = float(sum(fused)/len(fused)) if fused else 0.5
     label = _label_from_score(ai_score)
 
-    # confidenza: spread + contributo audio + qualità
-    # spread = deviazione dalla neutralità temporale
     dev = sum(abs(x-0.5) for x in fused)/max(len(fused),1)
     conf = 0.10 + 0.70*min(dev*2.0, 1.0) + 0.10*abs(a_mean-0.5)*2.0 + 0.10*(1.0 - comp_idx)
     confidence = int(round(_clamp(conf, 0.10, 0.99)*100))
 
-    # reason
     reasons = []
     if comp_idx >= 0.75:
         reasons.append("Compressione pesante (WhatsApp/ri-upload)")
@@ -141,7 +128,6 @@ def fuse(video_stats: Dict[str, Any], audio_stats: Dict[str, Any], meta: Dict[st
         reasons.append("Segnali misti o neutri")
 
     timeline_binned = [{"start": float(i), "end": float(i+1), "ai_score": float(fused[i])} for i in range(n_bins)]
-    # picchi “informativi”: scarta valori ~0.5
     peaks = [{"t": i, "ai_score": float(s)} for i,s in enumerate(fused) if s <= 0.35 or s >= 0.72]
 
     result = {
@@ -161,3 +147,4 @@ def fuse(video_stats: Dict[str, Any], audio_stats: Dict[str, Any], meta: Dict[st
         "timeline_binned": timeline_binned,
         "peaks": peaks,
         "hints": hints,
+    }
