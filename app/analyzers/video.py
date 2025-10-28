@@ -1,115 +1,120 @@
-# app/analyzers/video.py
-import os, glob, json, tempfile, subprocess
-from typing import Dict, Any, List, Tuple, Optional
-import numpy as np
 import cv2
+import numpy as np
 
-def _run(cmd: list) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True)
+def analyze(path: str, max_seconds: float = 30.0, fps: float = 2.5) -> dict:
+    """
+    Estrae statistiche video in modo leggero e conservativo:
+    - Campiona fino a ~30s a 2.5fps (≈ 75 frame max).
+    - Calcola:
+      * luminanza media per frame
+      * varianza del Laplaciano (edge/texture)
+      * differenza assoluta media tra frame consecutivi (motion proxy)
+    - Ritorna timeline per secondo (media dei frame caduti in quel secondo).
+    """
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return {"error": "opencv_open_failed"}
 
-def _sample_frames(path: str, target_fps: float = 2.5, max_frames: int = 60) -> Tuple[str, List[float]]:
-    tmp = tempfile.mkdtemp(prefix="frames_")
-    p = _run(["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", path])
-    duration = None
-    try:
-        info = json.loads(p.stdout or "{}")
-        duration = float((info.get("format") or {}).get("duration") or 0.0)
-    except: duration = None
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    duration = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) / src_fps) if src_fps > 0 else 0.0
 
-    span = duration if (duration and duration>0) else 24.0
-    fps = min(max_frames / max(span,0.1), target_fps)
-    fps = max(fps, 0.5)
+    # Limita l'intervallo
+    max_dur = min(max_seconds, duration if duration > 0 else max_seconds)
+    sample_step = max(1, int(round((src_fps / max(0.1, fps))))) if src_fps > 0 else 1
 
-    _run(["ffmpeg","-hide_banner","-v","error","-i", path, "-vf", f"fps={fps:.3f}", "-qscale:v","2", os.path.join(tmp,"frame_%05d.jpg")])
-    files = sorted(glob.glob(os.path.join(tmp,"frame_*.jpg")))
-    times = [(i+1)*(1.0/fps) for i in range(len(files))]
-    return tmp, times
+    frames_info = []
+    prev_gray = None
+    total_frames = 0
+    grabbed = 0
 
-def _optical_noise(gray: np.ndarray) -> float:
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
-    v = float(lap.var())
-    return float(np.clip(v/(v+1000.0), 0.0, 1.0))
+    # Leggiamo fino a max_dur seconds
+    max_frames_to_read = int(src_fps * max_dur) if src_fps > 0 else int(fps * max_dur * 2)
 
-def _edge_coherence(gray: np.ndarray) -> float:
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1,0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0,1, ksize=3)
-    mag = cv2.magnitude(gx, gy)
-    m, s = float(np.mean(mag)+1e-6), float(np.std(mag)+1e-6)
-    coh = m/(s+1e-6)
-    return float(np.clip(coh/(coh+5.0), 0.0, 1.0))
+    while grabbed < max_frames_to_read:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        grabbed += 1
 
-def _hist_cut_score(prev_gray: np.ndarray, gray: np.ndarray) -> float:
-    h1 = cv2.calcHist([prev_gray],[0],None,[64],[0,256])
-    h2 = cv2.calcHist([gray],[0],None,[64],[0,256])
-    h1 = cv2.normalize(h1,None).flatten()
-    h2 = cv2.normalize(h2,None).flatten()
-    d = float(cv2.norm(h1, h2, cv2.NORM_L2))
-    return float(np.clip(d, 0.0, 1.0))
+        # Sottocampionamento
+        if src_fps > 0 and (grabbed % sample_step != 0):
+            continue
 
-def _flicker_hz(luma: List[float], fps: float) -> Optional[float]:
-    if not luma or fps<=0: return None
-    x = np.array(luma, dtype=np.float32)
-    x = (x - x.mean())/(x.std()+1e-6)
-    X = np.fft.rfft(x); P = np.abs(X)
-    freqs = np.fft.rfftfreq(len(x), d=1.0/max(fps,1e-6))
-    m = (freqs>=40.0)&(freqs<=70.0)
-    if not np.any(m): return None
-    pf = float(freqs[m][np.argmax(P[m])])
-    if abs(pf-50.0)<5.0: return 50.0
-    if abs(pf-60.0)<5.0: return 60.0
-    return None
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        y_mean = float(gray.mean())
+        # Edge/texture
+        lap = cv2.Laplacian(gray, cv2.CV_64F)
+        edge_var = float(lap.var())
 
-def analyze_video(path: str) -> Dict[str, Any]:
-    frames_dir, times = _sample_frames(path, target_fps=2.5, max_frames=60)
-    files = sorted(glob.glob(os.path.join(frames_dir,"frame_*.jpg")))
-    last_gray = None
-    cut_count = 0
-    frame_scores: List[float] = []
-    luma_series: List[float] = []
-    flags: List[str] = []
+        # Motion (MAD tra frame)
+        motion = 0.0
+        if prev_gray is not None:
+            motion = float(np.mean(np.abs(gray.astype(np.float32) - prev_gray.astype(np.float32))))
+        prev_gray = gray
 
-    try:
-        for fp, t in zip(files, times):
-            img = cv2.imread(fp)
-            if img is None: continue
-            h,w = img.shape[:2]
-            scale = 256.0/max(h,w)
-            if scale<1.0:
-                img = cv2.resize(img,(int(w*scale),int(h*scale)), interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            luma_series.append(float(np.mean(gray)))
+        # Timestamp stimato
+        ts = (grabbed / (src_fps if src_fps > 0 else fps)) if src_fps > 0 else (len(frames_info) / fps)
 
-            noise = _optical_noise(gray)
-            edgec = _edge_coherence(gray)
-            score = float(np.clip(0.5 + 0.25*(1.0-noise) + 0.15*(edgec-0.5), 0.0, 1.0))
+        frames_info.append({
+            "t": ts,
+            "y_mean": y_mean,
+            "edge_var": edge_var,
+            "motion": motion
+        })
+        total_frames += 1
 
-            if last_gray is not None:
-                if _hist_cut_score(last_gray, gray)>0.55:
-                    cut_count += 1
-            last_gray = gray
+        # Bound extra sicurezza su numero frame totali
+        if total_frames >= int(fps * max_seconds) + 90:
+            break
 
-            frame_scores.append(score)
+    cap.release()
 
-        fps_est = len(files)/max((times[-1] if times else 1.0), 1e-6)
-        flick = _flicker_hz(luma_series, fps=fps_est)
+    # Binning per secondo
+    if not frames_info:
+        return {
+            "error": "no_frames_sampled",
+            "width": width, "height": height, "src_fps": src_fps, "duration": duration
+        }
 
-        timeline = []
-        for i,s in enumerate(frame_scores):
-            t = times[i] if i<len(times) else i
-            timeline.append({"start": max(t-0.5,0.0), "end": t+0.5, "ai_score": float(s)})
+    # raggruppa per int(t)
+    bins = {}
+    for f in frames_info:
+        sec = int(f["t"])
+        arr = bins.setdefault(sec, {"y_mean": [], "edge_var": [], "motion": []})
+        arr["y_mean"].append(f["y_mean"])
+        arr["edge_var"].append(f["edge_var"])
+        arr["motion"].append(f["motion"])
 
-        scores = {"frame_mean": float(np.mean(frame_scores)) if frame_scores else 0.5,
-                  "frame_std": float(np.std(frame_scores)) if frame_scores else 0.0}
-        video = {"cuts": int(cut_count), "flicker_hz": flick}
+    timeline = []
+    for sec in sorted(bins.keys()):
+        arr = bins[sec]
+        timeline.append({
+            "t": sec,
+            "y_mean": float(np.mean(arr["y_mean"])) if arr["y_mean"] else 0.0,
+            "edge_var": float(np.mean(arr["edge_var"])) if arr["edge_var"] else 0.0,
+            "motion": float(np.mean(arr["motion"])) if arr["motion"] else 0.0,
+        })
 
-        if flick in (50.0,60.0): flags.append("mains_flicker_detected")
-        if (scores["frame_mean"]<0.45) and (scores["frame_std"]<0.05): flags.append("low_motion")
+    # Statistiche globali
+    y_means = np.array([x["y_mean"] for x in timeline], dtype=np.float32)
+    edge_means = np.array([x["edge_var"] for x in timeline], dtype=np.float32)
+    motion_means = np.array([x["motion"] for x in timeline], dtype=np.float32)
 
-        return {"scores": scores, "video": video, "flags_video": flags, "timeline": timeline}
-    finally:
-        try:
-            for f in files:
-                try: os.remove(f)
-                except: pass
-            os.rmdir(frames_dir)
-        except: pass
+    stats = {
+        "width": width,
+        "height": height,
+        "src_fps": src_fps,
+        "duration": duration,
+        "sampled_fps": fps if src_fps > 0 else fps,  # logico
+        "frames_sampled": int(total_frames),
+        "timeline": timeline,
+        "summary": {
+            "y_mean_avg": float(y_means.mean()) if y_means.size else 0.0,
+            "edge_var_avg": float(edge_means.mean()) if edge_means.size else 0.0,
+            "motion_avg": float(motion_means.mean()) if motion_means.size else 0.0,
+            "motion_std": float(motion_means.std()) if motion_means.size else 0.0,
+        }
+    }
+    return stats
