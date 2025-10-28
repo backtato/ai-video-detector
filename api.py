@@ -23,7 +23,8 @@ DETECTOR_VERSION = os.getenv("DETECTOR_VERSION", "1.2.0")
 # CHANGED: default 100 MB; parametrico
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
 RESOLVER_MAX_BYTES = int(os.getenv("RESOLVER_MAX_BYTES", str(120 * 1024 * 1024)))
-ALLOWED_ORIGINS = [o for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o]
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]  # <— strip
+ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", "").strip()  # <— opzionale
 USE_YTDLP = os.getenv("USE_YTDLP", "1") not in ("0", "false", "False")
 RESOLVER_UA = os.getenv("RESOLVER_UA", "Mozilla/5.0 (compatible; AI-Video/1.0)")
 CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/aivideo-cache")
@@ -119,13 +120,25 @@ ALLOW_DOMAINS = {
 
 app = FastAPI(title=APP_NAME, version=DETECTOR_VERSION)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
+# --- CORS robusto: lista o regex, headers esposti, preflight ---
+cors_common = dict(
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["X-Detected-Lang", "X-Request-Id"]
 )
+if ALLOWED_ORIGIN_REGEX:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+        **cors_common
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
+        **cors_common
+    )
 
 def _raise_422(msg: str):
     raise HTTPException(status_code=422, detail=msg)
@@ -233,6 +246,10 @@ def _analyze_path(path: str, source_url: Optional[str]=None, resolved_url: Optio
         "detector_version": DETECTOR_VERSION,
     }
     return out
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "ai-video", "author": __author__}
 
 @app.get("/healthz")
 def healthz():
