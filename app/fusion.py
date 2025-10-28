@@ -1,101 +1,183 @@
-# app/fusion.py
-from typing import Dict, Any, List
+import math
 import numpy as np
 
-def _safe(v, d=0.5):
-    try:
-        if v is None: return d
-        return float(v)
-    except Exception:
-        return d
+THRESH_REAL = 0.38
+THRESH_AI = 0.72
 
-def _bin_timeline(timeline: List[dict], duration: float, bin_sec: float = 1.0, mode: str = "max") -> List[dict]:
-    if not timeline:
-        if duration and duration>0:
-            return [{"start":0.0,"end":min(duration,1.0),"ai_score":0.5}]
-        return [{"start":0.0,"end":1.0,"ai_score":0.5}]
-    if not duration or duration<=0:
-        duration = max([seg.get("end",0.0) for seg in timeline] + [1.0])
+# pesi conservativi
+W_VIDEO = 0.55
+W_AUDIO = 0.35
+W_HINTS = 0.10
 
-    out = []
-    t = 0.0
-    while t < duration:
-        te = min(t+bin_sec, duration)
-        vals = []
-        for seg in timeline:
-            s0, s1 = seg.get("start",0.0), seg.get("end",0.0)
-            if s1 <= t or s0 >= te: continue
-            vals.append(float(seg.get("ai_score",0.5)))
-        if not vals: vals=[0.5]
-        out.append({"start":float(t), "end":float(te), "ai_score": float(max(vals) if mode=="max" else np.mean(vals))})
-        t = te
-    return out
+def _score_from_video(vstats: dict) -> (float, list):
+    if not vstats or "timeline" not in vstats:
+        return 0.5, []
 
-def _dynamic_bin(bins: List[dict]) -> List[dict]:
-    if not bins: return bins
-    out = []
-    for b in bins:
-        s = _safe(b.get("ai_score"), 0.5)
-        if abs(s-0.5)>0.05 and (b["end"]-b["start"])>1.0:
-            mid = (b["start"]+b["end"])/2.0
-            out.append({"start": b["start"], "end": mid, "ai_score": s})
-            out.append({"start": mid, "end": b["end"], "ai_score": s})
-        else:
-            out.append(b)
-    return out
+    tl = vstats.get("timeline", [])
+    if not tl:
+        return 0.5, []
 
-def _peaks(bins: List[dict], min_dev: float=0.15, min_coverage: float=0.10) -> List[dict]:
-    if not bins: return []
-    total = sum(b["end"]-b["start"] for b in bins)
-    if total<=0: return []
-    high = [b for b in bins if abs(_safe(b.get("ai_score"),0.5)-0.5)>min_dev]
-    if not high: return []
+    # Heuristica: più motion/edge ⇒ meno “sintetico”
+    m = np.array([x.get("motion", 0.0) for x in tl], dtype=np.float32)
+    e = np.array([x.get("edge_var", 0.0) for x in tl], dtype=np.float32)
+
+    # Normalizzazioni robuste
+    def robust_norm(x):
+        if x.size == 0:
+            return x
+        xm = float(x.mean())
+        xs = float(x.std()) or 1.0
+        z = (x - xm) / xs
+        # mappa z in [0,1]
+        return 1.0 / (1.0 + np.exp(-z))
+
+    m_n = robust_norm(m)  # 0..1
+    e_n = robust_norm(e)  # 0..1
+
+    # Se entrambe basse (~0) ⇒ potenziale “sintetico/schermo”, score AI ↑
+    # Invertiamo il segno: 1 - max(m,e) => più basso dinamismo ⇒ score AI maggiore
+    per_sec_ai = (1.0 - np.maximum(m_n, e_n)).clip(0.0, 1.0)
+    score = float(per_sec_ai.mean()) if per_sec_ai.size else 0.5
+    return score, per_sec_ai.tolist()
+
+def _score_from_audio(astats: dict) -> (float, list):
+    if not astats or "timeline" not in astats:
+        return 0.5, []
+    tl = astats["timeline"]
+    # Semplice proxy: più silenzi/piattezza ⇒ più “sintetico”
+    rms = np.array([x.get("rms", 0.0) for x in tl], dtype=np.float32)
+    zcr = np.array([x.get("zcr", 0.0) for x in tl], dtype=np.float32)
+
+    # Normalizza robustamente
+    def rn(x):
+        if x.size == 0:
+            return x
+        xm = float(x.mean())
+        xs = float(x.std()) or 1.0
+        z = (x - xm) / xs
+        return 1.0 / (1.0 + np.exp(-z))
+
+    rms_n = rn(rms)
+    zcr_n = rn(zcr)
+
+    # Se entrambe basse ⇒ score AI ↑
+    per_sec_ai = (1.0 - np.maximum(rms_n, zcr_n)).clip(0.0, 1.0)
+    score = float(per_sec_ai.mean()) if per_sec_ai.size else 0.5
+    return score, per_sec_ai.tolist()
+
+def _score_from_hints(hints: dict) -> float:
+    if not hints:
+        return 0.5
+    # media pesata semplice: flag negativi spingono verso AI (↑)
+    # normalizziamo in [0,1]
+    vals = []
+    for k, v in hints.items():
+        if isinstance(v, dict) and "score" in v:
+            vals.append(float(v.get("score", 0.5)))
+    if not vals:
+        return 0.5
+    return float(np.mean(vals))
+
+def _bin_by_second(per_sec_seq: list, duration: float) -> list:
+    # per_sec_seq è già per-second in molti casi; qui lo allineiamo
+    if not per_sec_seq:
+        return []
+    # taglia alla durata
+    max_len = max(1, int(duration))
+    arr = per_sec_seq[:max_len]
+    return [{"t": i, "ai": float(arr[i])} for i in range(len(arr))]
+
+def _find_peaks(bins: list, min_prom: float = 0.15) -> list:
+    if not bins:
+        return []
+    arr = np.array([b["ai"] for b in bins], dtype=np.float32)
     peaks = []
-    cur = None
-    for b in high:
-        if cur is None: cur = dict(b)
-        else:
-            if abs(b["start"]-cur["end"])<1e-6:
-                cur["end"] = b["end"]
-                cur["ai_score"] = max(cur["ai_score"], b["ai_score"])
-            else:
-                peaks.append(cur); cur = dict(b)
-    if cur: peaks.append(cur)
-    peaks = [p for p in peaks if (p["end"]-p["start"])/total >= min_coverage]
+    if arr.size < 3:
+        return peaks
+    mean = float(arr.mean())
+    std = float(arr.std()) or 1.0
+    for i in range(1, arr.size - 1):
+        if arr[i] > arr[i-1] and arr[i] > arr[i+1]:
+            if (arr[i] - mean) > min_prom * std:
+                peaks.append({"t": int(bins[i]["t"]), "ai": float(arr[i])})
     return peaks
 
-def build_hints(meta: Dict[str,Any], video_flags: List[str], c2pa_present: bool, dev_fp: Dict[str,Any]) -> Dict[str,Any]:
-    return {
-        "no_c2pa": not bool(c2pa_present),
-        "apple_quicktime_tags": bool(dev_fp.get("apple_quicktime_tags")),
-        "editor_like": bool(dev_fp.get("editor_like")),
-        "low_motion": "low_motion" in (video_flags or []),
-    }
+def fuse(video_stats: dict, audio_stats: dict, hints: dict, meta: dict) -> dict:
+    duration = 0.0
+    try:
+        if video_stats and video_stats.get("duration"):
+            duration = float(video_stats["duration"])
+        elif meta and "summary" in meta and meta["summary"].get("duration"):
+            duration = float(meta["summary"]["duration"])
+    except Exception:
+        duration = 0.0
 
-def fuse_scores(frame: float, audio: float, hints: Dict[str,Any]) -> Dict[str,Any]:
-    f, a = _safe(frame,0.5), _safe(audio,0.5)
-    hs = 0.5
-    reasons = []
-    if hints.get("no_c2pa"): reasons.append("no_c2pa"); hs += 0.05
-    if hints.get("apple_quicktime_tags"): reasons.append("iphone_quicktime_tags"); hs -= 0.02
-    if hints.get("editor_like"): reasons.append("editing_software_tags"); hs += 0.05
-    if hints.get("low_motion"): reasons.append("low_motion"); hs += 0.03
-    hs = float(np.clip(hs, 0.0, 1.0))
+    v_score, v_seq = _score_from_video(video_stats)
+    a_score, a_seq = _score_from_audio(audio_stats)
+    h_score = _score_from_hints(hints)
 
-    ai_score = float(np.clip(0.6*f + 0.3*a + 0.1*hs, 0.0, 1.0))
-    if ai_score < 0.35: label = "real"
-    elif ai_score > 0.65: label = "ai"
-    else: label = "uncertain"
-    return {"ai_score": ai_score, "label": label, "reasons": reasons}
+    # Fusione conservativa
+    ai_score = float(W_VIDEO * v_score + W_AUDIO * a_score + W_HINTS * h_score)
+    ai_score = max(0.0, min(1.0, ai_score))
 
-def finalize_with_timeline(fusion_core: Dict[str,Any], bins: List[dict]) -> Dict[str,Any]:
-    if not bins:
-        conf, peaks = 0.5, []
+    # Label
+    if ai_score >= THRESH_AI:
+        label = "ai"
+    elif ai_score <= THRESH_REAL:
+        label = "real"
     else:
-        vals = [float(b["ai_score"]) for b in bins]
-        stdev = float(np.std(vals)) if vals else 0.0
-        conf = float(np.clip(1.0 - stdev, 0.0, 1.0))
-        peaks = _peaks(bins, min_dev=0.15, min_coverage=0.10)
-    out = dict(fusion_core)
-    out["confidence"] = conf
-    return out, peaks
+        label = "uncertain"
+
+    # Timeline binned
+    # Se abbiamo entrambe, facciamo media; altrimenti quella disponibile
+    max_len = int(max(len(v_seq), len(a_seq)))
+    per_sec = []
+    for i in range(max_len):
+        vs = v_seq[i] if i < len(v_seq) else None
+        as_ = a_seq[i] if i < len(a_seq) else None
+        if vs is None and as_ is None:
+            continue
+        if vs is None:
+            per_sec.append(as_)
+        elif as_ is None:
+            per_sec.append(vs)
+        else:
+            per_sec.append((vs + as_) / 2.0)
+
+    timeline_binned = _bin_by_second(per_sec, duration or len(per_sec))
+    peaks = _find_peaks(timeline_binned)
+
+    # Confidence = 1 - std (più stabile → più conf)
+    if per_sec:
+        std = float(np.std(np.array(per_sec, dtype=np.float32)))
+        confidence = float(max(0.0, min(1.0, 1.0 - std)))
+    else:
+        confidence = 0.5
+
+    # Reason sintetico
+    reasons = []
+    if label == "ai":
+        reasons.append("Pattern di bassa dinamica/texture compatibili con contenuto sintetico o schermata.")
+    elif label == "real":
+        reasons.append("Dinamica e texture più coerenti con cattura reale.")
+    else:
+        reasons.append("Segnali contrastanti o insufficienti; analisi conservativa.")
+
+    # Aggiungi hint principali
+    if hints:
+        neg = [k for k, v in hints.items() if isinstance(v, dict) and v.get("score", 0.5) > 0.6]
+        if neg:
+            reasons.append("Hints: " + ", ".join(neg))
+
+    result = {
+        "result": {
+            "label": label,
+            "ai_score": ai_score,
+            "confidence": confidence,
+            "reason": " ".join(reasons)
+        },
+        "timeline_binned": timeline_binned,
+        "peaks": peaks
+    }
+    return result
+
