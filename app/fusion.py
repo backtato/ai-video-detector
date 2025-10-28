@@ -1,137 +1,152 @@
 # app/fusion.py
-# Fusione adattiva video+audio+hints; soglie dinamiche per bitrate; confidenza leggibile;
-# reason codes più espliciti. Mantiene chiave 'result' e campi timeline_binned/peaks.
-
+import math
+from typing import Dict, Any, List
 import numpy as np
 
-BASE_THRESH_REAL = 0.38
-BASE_THRESH_AI   = 0.72
+THRESH_REAL = 0.35
+THRESH_AI   = 0.72
+
+# pesi conservativi
 W_VIDEO = 0.55
 W_AUDIO = 0.35
-W_HINTS = 0.10
+W_HINTS = 0.10  # l'AI-score non usa hint in modo diretto; gli hint pesano su reason/confidence
 
-def _score_from_video(vstats: dict):
-    if not vstats or "timeline" not in vstats:
-        return 0.5, []
-    tl = vstats.get("timeline", [])
-    motion = np.array([x.get("motion", 0.0) for x in tl], dtype=np.float32)
-    edge   = np.array([x.get("edge_var", 0.0) for x in tl], dtype=np.float32)
-    dup    = np.array([x.get("dup", 0.0) for x in tl], dtype=np.float32)
-    block  = np.array([x.get("blockiness", 0.0) for x in tl], dtype=np.float32)
-    band   = np.array([x.get("banding", 0.0) for x in tl], dtype=np.float32)
+def _clamp(x: float, lo: float=0.0, hi: float=1.0) -> float:
+    return max(lo, min(hi, x))
 
-    def rn(x):
-        if x.size == 0: return x
-        xm, xs = float(x.mean()), float(x.std() or 1.0)
-        z = (x - xm) / xs
-        return 1.0 / (1.0 + np.exp(-z))
+def _safe(d: Dict, *keys, default=None):
+    cur = d
+    for k in keys:
+        if cur is None or not isinstance(cur, dict):
+            return default
+        cur = cur.get(k)
+    return cur if cur is not None else default
 
-    # Heuristica: più dup/block/band → più probabile sintetico/schermo
-    v_ai = np.clip(0.25*(1.0 - rn(motion)) +
-                   0.25*(1.0 - rn(edge)) +
-                   0.25*rn(dup) +
-                   0.25*(rn(block) + rn(band))/2.0, 0.0, 1.0)
-    score = float(v_ai.mean()) if v_ai.size else 0.5
-    return score, v_ai.tolist()
+def _quality_from_video(vstats: dict, meta: dict) -> float:
+    """Stima 0..1 della qualità (1 = ottima). Penalizza duplicati, blockiness, banding."""
+    s = vstats.get('summary', {})
+    blockiness = float(s.get('blockiness_avg', 0.0))
+    banding    = float(s.get('banding_avg', 0.0))
+    dup_avg    = float(s.get('dup_avg', 0.0))
 
-def _score_from_audio(astats: dict):
-    if not astats: return 0.5, []
-    tts_like = float(astats.get("scores", {}).get("tts_like", 0.0))
-    audio_mean = float(astats.get("scores", {}).get("audio_mean", 0.5))
-    score = float(0.6*audio_mean + 0.4*tts_like)
-    timeline = astats.get("timeline", [])
-    return score, [float(x.get("ai_score", score)) for x in timeline]
+    def norm(v, lo, hi):
+        try:
+            return _clamp((v - lo) / (hi - lo))
+        except Exception:
+            return 0.0
 
-def _score_from_hints(hints: dict):
-    if not hints: return 0.5
-    vals = [float(v.get("score", 0.5)) for v in hints.values() if isinstance(v, dict)]
-    return float(np.mean(vals)) if vals else 0.5
+    # taratura conservativa per WhatsApp/screen-rec
+    q_penalty  = 0.5*norm(blockiness, 0.02, 0.06) \
+               + 0.3*norm(banding,    0.30, 0.42) \
+               + 0.4*norm(dup_avg,    0.88, 0.98)
+    q = max(0.0, 1.0 - q_penalty)
+    return q
 
-def _bin_by_second(seq, duration):
-    if not isinstance(seq, (list, tuple)) or not seq:
+def _video_ai_per_second(vstats: dict) -> List[float]:
+    """Heuristica leggera per ricavare un 'sospetto AI' per secondo dal video.
+    Baseline 0.5. Aumenta leggermente con pattern inconsueti; riduce con motion vera."""
+    tl = vstats.get('timeline', [])
+    if not tl:
         return []
-    n = min(int(duration) if duration else len(seq), len(seq))
+    scores = []
+    for sec in tl:
+        motion      = float(sec.get('motion', 0.0))
+        dup         = float(sec.get('dup', 0.0))
+        blockiness  = float(sec.get('blockiness', 0.0))
+        banding     = float(sec.get('banding', 0.0))
+        s = 0.5
+        s +=  0.04 if banding > 0.40 else 0.0
+        s +=  0.03 if blockiness > 0.04 else 0.0
+        s +=  0.03 if dup > 0.95 else 0.0
+        s -=  0.05 if motion > 15.0 else 0.0
+        scores.append(_clamp(s, 0.0, 1.0))
+    return scores
+
+def _audio_ai_per_second(astats: dict) -> List[float]:
+    tl = _safe(astats, 'timeline', default=[])
+    if not tl:
+        return []
+    return [float(sec.get('ai_score', 0.5)) for sec in tl]
+
+def _combine_per_second(v: List[float], a: List[float]) -> List[float]:
+    n = max(len(v), len(a))
+    if n == 0:
+        return []
     out = []
+    v_mean = (sum(v)/len(v)) if v else 0.5
+    a_mean = (sum(a)/len(a)) if a else 0.5
     for i in range(n):
-        out.append({"start": float(i), "end": float(i+1), "ai_score": float(seq[i])})
+        vs  = v[i] if i < len(v) else v_mean
+        as_ = a[i] if i < len(a) else a_mean
+        s = W_VIDEO*vs + W_AUDIO*as_ + W_HINTS*0.5
+        out.append(_clamp(s, 0.0, 1.0))
     return out
 
-def fuse(video_stats=None, audio_stats=None, hints=None, meta=None):
-    hints = hints or {}
-    meta = meta or {}
-    duration = 0.0
-    try:
-        duration = float(video_stats.get("duration", 0.0))
-    except Exception:
-        pass
+def _peaks(timeline: List[float], min_score: float = 0.55, min_len: int = 2) -> List[Dict[str, float]]:
+    peaks = []
+    start = None
+    for i, val in enumerate(timeline):
+        if val >= min_score:
+            if start is None:
+                start = i
+        else:
+            if start is not None and (i - start) >= min_len:
+                peaks.append({'start': float(start), 'end': float(i), 'score': float(np.mean(timeline[start:i]))})
+            start = None
+    if start is not None and (len(timeline) - start) >= min_len:
+        peaks.append({'start': float(start), 'end': float(len(timeline)), 'score': float(np.mean(timeline[start:]))})
+    return peaks
 
-    v_score, v_seq = _score_from_video(video_stats)
-    a_score, a_seq = _score_from_audio(audio_stats)
-    h_score = _score_from_hints(hints)
+def fuse(video_stats: dict, audio_stats: dict, hints: dict, meta: dict) -> Dict[str, Any]:
+    # per-second fusion
+    v_per = _video_ai_per_second(video_stats)
+    a_per = _audio_ai_per_second(audio_stats)
+    fused = _combine_per_second(v_per, a_per)
 
-    # Pesi adattivi se audio manca
-    wv, wa, wh = W_VIDEO, W_AUDIO, W_HINTS
-    if not audio_stats or not a_seq:
-        wa = 0.0
-        total = wv + wh
-        if total > 0:
-            wv, wh = wv/total, wh/total
+    # ai_score finale come media dei secondi analizzati
+    ai_score = float(np.mean(fused)) if fused else 0.5
 
-    ai_score = float(np.clip(wv * v_score + wa * a_score + wh * h_score, 0.0, 1.0))
+    # qualità e confidence
+    q = _quality_from_video(video_stats, meta)
+    margin = abs(ai_score - 0.5) / 0.5  # 0..1
+    confidence = 0.35 + 0.65 * margin * q
+    confidence = float(_clamp(confidence, 0.0, 1.0))
 
-    # Soglie dinamiche per bitrate basso (WhatsApp/schermo)
-    bit_rate = float(meta.get("bit_rate", 0.0) or meta.get("summary", {}).get("bit_rate", 0.0) or 0.0)
-    t_real, t_ai = BASE_THRESH_REAL, BASE_THRESH_AI
-    if bit_rate and bit_rate < 800_000:
-        t_real = 0.34
-        t_ai   = 0.76
-
-    # Label
-    if ai_score >= t_ai:
-        label = "ai"
-    elif ai_score <= t_real:
-        label = "real"
+    # label conservativa + quality gate
+    if ai_score <= THRESH_REAL:
+        label = 'real'
+    elif ai_score >= THRESH_AI and q >= 0.55:
+        label = 'ai'
     else:
-        label = "uncertain"
+        label = 'uncertain'
 
-    # Confidenza (0..1) → UI la può mappare a percentuale
-    dist = max(ai_score - t_ai, t_real - ai_score, 0.0)
-    span = max(t_ai - t_real, 1e-6)
-    confidence = float(np.clip(0.5 + (dist / span), 0.0, 1.0))
+    # peaks per UI (segmenti da rivedere)
+    pk = _peaks(fused, min_score=0.55, min_len=2)
 
-    # Timeline binned (merge semplice video/audio)
-    max_len = int(max(len(v_seq), len(a_seq)))
-    per_sec = []
-    for i in range(max_len):
-        vs = v_seq[i] if i < len(v_seq) else None
-        as_ = a_seq[i] if i < len(a_seq) else None
-        if vs is None and as_ is None:
-            continue
-        if vs is None: per_sec.append(as_)
-        elif as_ is None: per_sec.append(vs)
-        else: per_sec.append(float(0.6*vs + 0.4*as_))
-    timeline_binned = _bin_by_second(per_sec, duration)
-
-    # Peaks
-    peaks = [{"t": float(i), "ai_score": float(s)} for i, s in enumerate(per_sec) if s is not None and s >= 0.85][:10]
-
-    # Reason codes
-    reasons = []
-    neg = [k for k, v in (hints or {}).items() if isinstance(v, dict) and v.get("score", 0.5) >= 0.6][:5]
-    pos = [k for k, v in (hints or {}).items() if isinstance(v, dict) and v.get("score", 0.5) <= 0.45][:5]
-    if neg: reasons.append("Hints−: " + ", ".join(neg))
-    if pos: reasons.append("Hints+: " + ", ".join(pos))
-    if bit_rate and bit_rate < 800_000: reasons.append("Bitrate molto basso → soglie conservative.")
-    if not a_seq: reasons.append("Audio assente o non utilizzabile.")
-    if label == "uncertain": reasons.append("Segnali misti o qualità/compressione limitante.")
+    # reason
+    reasons: List[str] = []
+    if q < 0.35:
+        reasons.append('Qualità limitante (compressione/duplicati): valutazione prudente.')
+    if hints:
+        neg = [k for k in hints.keys() if 'heavy' in k or 'low_' in k or 'very_low' in k]
+        pos = [k for k in hints.keys() if 'c2pa_present' in k or 'authentic' in k]
+        if pos:
+            reasons.append('Indizi positivi: ' + ', '.join(pos))
+        if neg:
+            reasons.append('Indizi di bassa qualità: ' + ', '.join(neg))
+    if pk:
+        segs = [f"{int(p['start'])}-{int(p['end'])}s" for p in pk[:3]]
+        reasons.append('Segmenti borderline da rivedere: ' + ', '.join(segs))
 
     return {
-        "result": {
-            "label": label,
-            "ai_score": ai_score,
-            "confidence": confidence,
-            "reason": " ".join(reasons).strip()
+        'result': {
+            'label': label,
+            'ai_score': float(ai_score),
+            'confidence': float(confidence),
+            'reason': ' '.join(reasons) if reasons else 'Valutazione conservativa.'
         },
-        "timeline_binned": timeline_binned,
-        "peaks": peaks
+        'timeline_binned': [
+            {'start': float(i), 'end': float(i+1), 'ai_score': float(s)} for i, s in enumerate(fused)
+        ],
+        'peaks': pk
     }
