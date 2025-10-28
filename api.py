@@ -1,4 +1,4 @@
-# app/api.py
+# api.py
 import os
 import io
 import shutil
@@ -7,182 +7,236 @@ import traceback
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+import subprocess
+import json
+import httpx
+import mimetypes
+
+from app.analyzers import video as video_an
 from app.analyzers import audio as audio_an
+from app.analyzers import meta  as meta_an
+from app.analyzers import forensic as forensic_an
 from app.analyzers import fusion as fusion_an
+from app.analyzers import heuristics_v2 as heur_an
 
-# --- Config da ENV ---
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))  # 50MB
-RESOLVER_MAX_BYTES = int(os.getenv("RESOLVER_MAX_BYTES", str(120 * 1024 * 1024)))
-ALLOWED_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS", "").split(",")) if o.strip()]
+# ==== ENV / CONFIG ==========================================================
+MAX_UPLOAD_BYTES     = int(os.getenv("MAX_UPLOAD_BYTES",      str(100 * 1024 * 1024)))  # 100MB
+RESOLVER_MAX_BYTES   = int(os.getenv("RESOLVER_MAX_BYTES",    str(120 * 1024 * 1024)))
+REQUEST_TIMEOUT_S    = int(os.getenv("REQUEST_TIMEOUT_S",     "120"))
+ALLOWED_ORIGINS      = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX")
+USE_YTDLP            = os.getenv("USE_YTDLP", "1") == "1"
+RESOLVER_UA          = os.getenv("RESOLVER_UA", "Mozilla/5.0 (AVD)")
+YTDLP_OPTS           = os.getenv("YTDLP_OPTS", '{"noplaylist":true,"continuedl":false,"retries":1}')
 
-app = FastAPI(title="AI-Video Detector API")
+# ==== APP ===================================================================
+app = FastAPI()
 
-# --- CORS ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS or ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+cors_kwargs = {
+    "allow_credentials": True,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if ALLOWED_ORIGIN_REGEX:
+    cors_kwargs["allow_origin_regex"] = ALLOWED_ORIGIN_REGEX
+else:
+    cors_kwargs["allow_origins"] = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 
-# --- Utils ---
+app.add_middleware(CORSMiddleware, **cors_kwargs)
+
+# ==== UTILS ================================================================
 
 def _tmpdir(prefix: str = "aiv_") -> str:
     return tempfile.mkdtemp(prefix=prefix)
 
 def _cleanup_dir(path: str):
+    try: shutil.rmtree(path, ignore_errors=True)
+    except Exception: pass
+
+def _fail(status: int, error: str, **extra):
+    payload = {"detail": {"error": error}}
+    if extra:
+        payload["detail"].update(extra)
+    return JSONResponse(status_code=status, content=payload)
+
+def _ffprobe_json(path: str) -> Dict[str, Any]:
+    cmd = ["ffprobe","-v","error","-print_format","json","-show_format","-show_streams","-show_chapters", path]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
     try:
-        shutil.rmtree(path, ignore_errors=True)
+        return json.loads(p.stdout or "{}")
+    except Exception:
+        return {}
+
+def _meta_from_ffprobe(ffj: Dict[str, Any]) -> Dict[str, Any]:
+    vstreams = [s for s in ffj.get("streams",[]) if s.get("codec_type")=="video"]
+    astreams = [s for s in ffj.get("streams",[]) if s.get("codec_type")=="audio"]
+    width = vstreams[0].get("width") if vstreams else None
+    height = vstreams[0].get("height") if vstreams else None
+    fps = None
+    if vstreams:
+        r = vstreams[0].get("avg_frame_rate") or vstreams[0].get("r_frame_rate")
+        try:
+            if r and "/" in r:
+                n,d = r.split("/")
+                n, d = float(n), float(d or 1)
+                fps = n/d if d else None
+        except Exception:
+            fps = None
+    duration = None
+    try:
+        duration = float(ffj.get("format",{}).get("duration", 0.0))
     except Exception:
         pass
+    bit_rate = None
+    try:
+        bit_rate = int(ffj.get("format",{}).get("bit_rate", 0))
+    except Exception:
+        pass
+    vcodec = vstreams[0].get("codec_name") if vstreams else None
+    acodec = astreams[0].get("codec_name") if astreams else None
+    fmt    = ffj.get("format",{}).get("format_name")
+    return {
+        "width": width, "height": height, "fps": fps, "duration": duration,
+        "bit_rate": bit_rate, "vcodec": vcodec, "acodec": acodec, "format_name": fmt
+    }
 
-def _probe_meta(video_path: str) -> Dict[str, Any]:
-    """
-    Qui presupponiamo che tu abbia già una funzione altrove che estrae meta+forensic+video_timeline.
-    Per mantenere compatibilità con la tua struttura, emuliamo il formato che stai usando in UI.
-    Sostituisci questo stub con il tuo vero extractor, oppure lascia la tua implementazione com'era.
-    """
-    # *** IMPORTANTE ***
-    # Se nel tuo progetto hai già un modulo `app.analyzers.video` con `analyze(path)`,
-    # usa quello e restituisci il dict con le stesse chiavi mostrate nei log.
-    from app.analyzers import video as video_an
-    meta, video = video_an.analyze(video_path)
-    # meta: { width, height, fps, duration, bit_rate, vcodec, acodec, format_name, source_url, resolved_url, forensic{...} }
-    # video: { width, height, src_fps, duration, sampled_fps, frames_sampled, timeline[...], summary{...} }
-    return meta, video
+def _sniff_is_media(content_type: str, url: str) -> bool:
+    if not content_type:
+        mt, _ = mimetypes.guess_type(url)
+        content_type = mt or ""
+    content_type = content_type.lower()
+    if "text/html" in content_type: return False
+    if "application/vnd.apple.mpegurl" in content_type: return False  # HLS
+    if content_type.startswith("video/") or content_type.startswith("audio/"):
+        return True
+    return False
 
-def _fuse(meta: Dict[str,Any], video: Dict[str,Any], audio: Dict[str,Any]) -> Dict[str, Any]:
-    return fusion_an.fuse(video=video, audio=audio, meta=meta or {})
+async def _download_url_to_file(url: str, max_bytes: int) -> str:
+    tmpd = _tmpdir("dl_")
+    out = os.path.join(tmpd, "media.bin")
 
-def _ok(payload: Dict[str, Any]) -> JSONResponse:
-    return JSONResponse(payload, status_code=200)
+    # 1) yt-dlp (se abilitato)
+    if USE_YTDLP:
+        ytopts = json.loads(YTDLP_OPTS or "{}")
+        cmd = ["yt-dlp","-g","--no-warnings"]
+        for k,v in ytopts.items():
+            if isinstance(v, bool):
+                if v: cmd.append(f"--{k}")
+            else:
+                cmd += [f"--{k}", str(v)]
+        cmd.append(url)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if p.returncode == 0 and p.stdout.strip():
+            direct = p.stdout.strip().splitlines()[0]
+            url = direct  # rimpiazza con stream diretto
 
-def _fail(status: int, message: str, extra: Dict[str,Any] = None) -> JSONResponse:
-    body = {"detail": {"error": message}}
-    if extra:
-        body["detail"].update(extra)
-    return JSONResponse(body, status_code=status)
+    # 2) httpx con UA e limite dimensione
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S, headers={"User-Agent": RESOLVER_UA}) as client:
+        r = await client.get(url, follow_redirects=True)
+        ct = r.headers.get("content-type","")
+        if not _sniff_is_media(ct, url):
+            # rate limit / login wall → 422 con hint
+            if "text/html" in (ct or "").lower():
+                raise HTTPException(status_code=422, detail="Login required, paywall o pagina HTML (usa upload o screen recording).")
+            raise HTTPException(status_code=415, detail="MIME non supportato o non multimediale.")
+        data = r.content
+        if len(data) == 0:
+            raise HTTPException(status_code=415, detail="File vuoto o non ricevuto")
+        if len(data) > max_bytes:
+            raise HTTPException(status_code=413, detail=f"File troppo grande (> {max_bytes} bytes)")
+        with open(out, "wb") as f:
+            f.write(data)
+    return out
 
-# --- Endpoints ---
+def _analyze_file(path: str) -> Dict[str, Any]:
+    ffj = _ffprobe_json(path)
+    meta_base = _meta_from_ffprobe(ffj)
+
+    # meta esteso + forensic
+    meta_ext     = {"meta": meta_base}
+    meta_device  = meta_an.detect_device(path)
+    meta_c2pa    = meta_an.detect_c2pa(path)
+    forensic     = forensic_an.analyze(path)
+    meta_ext.update(meta_device)
+    meta_ext["forensic"] = {"c2pa": meta_c2pa.get("present", False)}
+    meta_ext["ffprobe_raw"] = bool(ffj)
+
+    # analysis
+    vstats = video_an.analyze(path, max_seconds=30)
+    astats = audio_an.analyze(path, target_sr=16000)
+
+    # hints (facoltativi)
+    hints = heur_an.compute_hints(vstats, astats, meta_ext)
+
+    fused = fusion_an.fuse(vstats, astats, {"meta": meta_base, "forensic": {"c2pa": meta_c2pa}})
+    # aggrega e restituisce
+    return {
+        "ok": True,
+        "meta": meta_base,
+        "forensic": {"c2pa": {"present": bool(meta_c2pa.get("present", False))}},
+        "video": vstats,
+        "audio": astats,
+        "hints": hints,
+        **fused
+    }
+
+# ==== ROUTES ===============================================================
 
 @app.get("/healthz")
-def healthz():
+async def healthz():
     return PlainTextResponse("ok")
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    # Valida dimensione
-    try:
-        content = await file.read()
-    except Exception as e:
-        return _fail(400, f"Errore lettura file: {e}")
-    if not content:
+    if not file or not file.filename:
         return _fail(415, "File vuoto o non ricevuto")
-
-    if len(content) > MAX_UPLOAD_BYTES:
+    # limita dimensione
+    data = await file.read()
+    if len(data) == 0:
+        return _fail(415, "File vuoto o non ricevuto")
+    if len(data) > MAX_UPLOAD_BYTES:
         return _fail(413, f"File troppo grande (> {MAX_UPLOAD_BYTES} bytes)")
-
-    work = _tmpdir()
+    tmpd = _tmpdir("up_")
+    path = os.path.join(tmpd, file.filename)
+    with open(path, "wb") as f:
+        f.write(data)
     try:
-        in_path = os.path.join(work, file.filename or "upload.bin")
-        with open(in_path, "wb") as f:
-            f.write(content)
-
-        # --- ANALISI ---
-        meta, video = _probe_meta(in_path)
-        audio = audio_an.analyze(in_path)  # nuovo audio analyzer robusto
-
-        # === FUSIONE ===
-        fused = _fuse(meta=meta, video=video, audio=audio)
-
-        # Risposta compatibile con UI v1.1.3 (stesse chiavi viste nei tuoi log)
-        return _ok({
-            "ok": True,
-            "meta": meta,
-            "video": video,
-            "audio": audio,
-            "hints": {
-                "heavy_compression": {
-                    "score": 1.0 if "heavy_compression" in fused.get("reason","") else 0.0,
-                    "reason": "Forte compressione (blockiness/banding)." if "compressione" in fused.get("reason","").lower() else ""
-                }
-            },
-            "result": {
-                "label": fused["label"],
-                "ai_score": fused["ai_score"],
-                "confidence": fused["confidence"],
-                "reason": fused["reason"]
-            },
-            "timeline_binned": fused["timeline_binned"],
-            "peaks": fused.get("peaks", [])
-        })
-
+        out = _analyze_file(path)
+        return JSONResponse(out)
+    except HTTPException as e:
+        return _fail(e.status_code, str(e.detail))
     except Exception as e:
-        return _fail(500, "Errore interno", {"trace": traceback.format_exc(), "msg": str(e)})
+        return _fail(500, "Errore interno", traceback=traceback.format_exc())
     finally:
-        _cleanup_dir(work)
+        _cleanup_dir(tmpd)
 
 @app.post("/analyze-url")
-async def analyze_url(
-    url: Optional[str] = Form(None),
-    link: Optional[str] = Form(None),
-    q:    Optional[str] = Form(None),
-):
-    """
-    Mantiene compatibilità: accetta url|link|q via FormData.
-    Qui presupponiamo che tu abbia già un resolver yt-dlp/httpx robusto come nelle tue versioni recenti.
-    """
-    the_url = (url or link or q or "").strip()
-    if not the_url:
-        return _fail(422, "Nessun URL fornito")
-
-    work = _tmpdir()
+async def analyze_url(url: str = Form(...)):
+    url = (url or "").strip()
+    if not url:
+        return _fail(422, "URL mancante")
     try:
-        # Scarica/risolvi in in_path (usa il tuo modulo esistente)
-        from app.utils import fetch  # <-- se il tuo progetto usa un altro modulo, sostituisci qui
-        in_path, meta_src = fetch.download(the_url, work_dir=work, max_bytes=RESOLVER_MAX_BYTES)
-
-        meta, video = _probe_meta(in_path)
-        # incorpora origine se disponibile
-        if meta_src:
-            meta.update({k:v for k,v in meta_src.items() if k not in meta})
-
-        audio = audio_an.analyze(in_path)
-        fused = _fuse(meta=meta, video=video, audio=audio)
-
-        return _ok({
-            "ok": True,
-            "meta": meta,
-            "video": video,
-            "audio": audio,
-            "hints": {
-                "heavy_compression": {
-                    "score": 1.0 if "heavy_compression" in fused.get("reason","") else 0.0,
-                    "reason": "Forte compressione (blockiness/banding)." if "compressione" in fused.get("reason","").lower() else ""
-                }
-            },
-            "result": {
-                "label": fused["label"],
-                "ai_score": fused["ai_score"],
-                "confidence": fused["confidence"],
-                "reason": fused["reason"]
-            },
-            "timeline_binned": fused["timeline_binned"],
-            "peaks": fused.get("peaks", [])
-        })
-
-    except fetch.NeedsCookies as e:
-        return _fail(422, "DownloadError yt-dlp: login/cookie richiesti", {"needs_cookies": True, "hint": str(e)})
-    except fetch.RateLimited as e:
-        return _fail(429, "Rate limited dalla piattaforma", {"rate_limited": True, "hint": str(e)})
+        path = await _download_url_to_file(url, RESOLVER_MAX_BYTES)
+    except HTTPException as e:
+        return _fail(e.status_code, str(e.detail))
     except Exception as e:
-        return _fail(500, "Errore interno", {"trace": traceback.format_exc(), "msg": str(e)})
+        # yt-dlp: login required / rate limit message?
+        msg = str(e)
+        if "Login required" in msg or "cookies" in msg.lower():
+            return _fail(422, "Login richiesto o rate-limit: usa upload o screen-recording")
+        return _fail(422, f"DownloadError: {msg[:200]}")
+    try:
+        out = _analyze_file(path)
+        return JSONResponse(out)
+    except HTTPException as e:
+        return _fail(e.status_code, str(e.detail))
+    except Exception as e:
+        return _fail(500, "Errore interno", traceback=traceback.format_exc())
     finally:
-        _cleanup_dir(work)
+        _cleanup_dir(os.path.dirname(path))
 
 @app.post("/predict")
 async def predict(
@@ -192,9 +246,9 @@ async def predict(
     q:    Optional[str] = Form(None),
 ):
     """
-    End-point retro-compatibile:
-    - Se arriva un file → come /analyze
-    - Se arriva un URL → come /analyze-url
+    Retro-compatibile:
+      - se arriva un file → /analyze
+      - se arriva un URL → /analyze-url
     """
     if file is not None:
         return await analyze(file=file)
