@@ -1,3 +1,9 @@
 # app/analyzers/__init__.py
-# Non importare i sotto-moduli qui: evita i circular import.
-__all__ = ["video", "audio", "meta", "forensic", "heuristics_v2", "fusion"]
+from . import video
+from . import audio
+from . import fusion
+from . import meta
+from . import forensic
+from . import heuristics_v2
+
+__all__ = ["video", "audio", "fusion", "meta", "forensic", "heuristics_v2"]
