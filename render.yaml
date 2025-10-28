@@ -8,6 +8,10 @@ services:
     envVars:
       - key: ALLOWED_ORIGINS
         sync: false
+      # In alternativa alla lista, puoi usare una regex:
+      # - key: ALLOWED_ORIGIN_REGEX
+      #   value: "^https://(www\\.)?greensovereignfund\\.ch$"
+
       - key: MAX_UPLOAD_BYTES          # CHANGED
         value: "104857600"             # 100 MB
       - key: RESOLVER_MAX_BYTES
@@ -17,6 +21,6 @@ services:
       - key: USE_YTDLP
         value: "1"
       - key: RESOLVER_UA
-        value: "Mozilla/5.0 (AVD/1.0; +https://ai-video.org)"
+        value: "Mozilla/5.0 (AVD/1.0; +https://www.aurora-noor.com)"
       - key: YTDLP_OPTS
         value: '{"noplaylist":true,"continuedl":false,"retries":1}'
