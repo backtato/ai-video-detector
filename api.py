@@ -13,6 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+# === Tentativo opzionale: OpenCV per fallback FPS ===
+try:
+    import cv2  # opencv-python-headless
+except Exception:
+    cv2 = None
+
 # === Config da ENV ===
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))  # 100MB
 RESOLVER_MAX_BYTES = int(os.getenv("RESOLVER_MAX_BYTES", str(120 * 1024 * 1024)))
@@ -232,9 +238,67 @@ def _download_via_ytdlp(url: str, dst_dir: str) -> Dict[str, Any]:
 
 # === Fallback meta summary (FPS/size/duration/bitrate) ===
 
+def _safe_num(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def _estimate_fps_via_opencv(path: str) -> Optional[float]:
+    """
+    Ultimo fallback: prova a stimare l'FPS con OpenCV senza leggere tutto il file.
+    1) CAP_PROP_FPS se sensato (1 < fps < 120)
+    2) altrimenti legge timestamp dei primi ~2 secondi e usa la mediana dei delta
+    """
+    if cv2 is None:
+        return None
+    try:
+        cap = cv2.VideoCapture(path)
+        try:
+            fps_prop = cap.get(cv2.CAP_PROP_FPS)
+            if fps_prop and fps_prop > 1.0 and fps_prop < 120.0:
+                return float(fps_prop)
+            # stima via timestamp
+            timestamps = []
+            ms0 = None
+            frames = 0
+            # leggi al massimo 120 frame o 2 secondi
+            while frames < 120:
+                ok, _ = cap.read()
+                if not ok:
+                    break
+                ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                if ms is None:
+                    break
+                if ms0 is None:
+                    ms0 = ms
+                dt = ms - ms0
+                if dt > 2000:  # ~2s
+                    break
+                timestamps.append(ms)
+                frames += 1
+            if len(timestamps) > 5:
+                deltas = [t2 - t1 for t1, t2 in zip(timestamps[:-1], timestamps[1:]) if (t2 - t1) > 0.5]
+                if deltas:
+                    # mediana dei delta → fps
+                    deltas_sorted = sorted(deltas)
+                    mid = len(deltas_sorted) // 2
+                    if len(deltas_sorted) % 2 == 1:
+                        med = deltas_sorted[mid]
+                    else:
+                        med = 0.5 * (deltas_sorted[mid - 1] + deltas_sorted[mid])
+                    if med > 0:
+                        return 1000.0 / med
+        finally:
+            cap.release()
+    except Exception:
+        return None
+    return None
+
 def _extract_video_summary_from_ffprobe(ff: dict) -> dict:
-    """Fallback: crea un summary con width/height/fps/duration/bit_rate da ffprobe."""
+    """Fallback: crea un summary con width/height/fps/duration/bit_rate da ffprobe (robusto per iPhone/QuickTime)."""
     out = {}
+    fps_source = None
     try:
         fmt = ff.get("format", {}) if isinstance(ff, dict) else {}
         if "bit_rate" in fmt:
@@ -243,10 +307,10 @@ def _extract_video_summary_from_ffprobe(ff: dict) -> dict:
             except Exception:
                 pass
         if "duration" in fmt:
-            try:
-                out["duration"] = float(fmt["duration"])
-            except Exception:
-                pass
+            d = _safe_num(fmt.get("duration"))
+            if d:
+                out["duration"] = float(d)
+
         vstreams = [s for s in ff.get("streams", []) if s.get("codec_type") == "video"]
         if vstreams:
             vs = vstreams[0]
@@ -254,21 +318,57 @@ def _extract_video_summary_from_ffprobe(ff: dict) -> dict:
             h = vs.get("height")
             if w: out["width"] = int(w)
             if h: out["height"] = int(h)
-            r_fps = vs.get("r_frame_rate") or vs.get("avg_frame_rate")
-            if isinstance(r_fps, str) and "/" in r_fps:
+
+            # 1) Prova nb_frames / duration (spesso assente su iPhone, ma se c'è è affidabile)
+            nb = vs.get("nb_frames")
+            if nb and "duration" in out:
                 try:
-                    a, b = r_fps.split("/")
-                    a, b = int(a), int(b)
-                    if b != 0:
-                        out["fps"] = float(a) / float(b)
+                    nb = float(nb)
+                    if nb > 1 and out["duration"] > 0:
+                        out["fps"] = nb / out["duration"]
+                        fps_source = "ffprobe_nbframes"
                 except Exception:
                     pass
+
+            # 2) Prova r_frame_rate o avg_frame_rate (evita 0/0)
+            if "fps" not in out:
+                r = vs.get("r_frame_rate")
+                if isinstance(r, str) and "/" in r and r != "0/0":
+                    try:
+                        a, b = r.split("/")
+                        a, b = float(a), float(b)
+                        if b > 0 and 1.0 < (a/b) < 240.0:
+                            out["fps"] = a / b
+                            fps_source = "ffprobe_r"
+                    except Exception:
+                        pass
+            if "fps" not in out:
+                r = vs.get("avg_frame_rate")
+                if isinstance(r, str) and "/" in r and r != "0/0":
+                    try:
+                        a, b = r.split("/")
+                        a, b = float(a), float(b)
+                        if b > 0 and 1.0 < (a/b) < 240.0:
+                            out["fps"] = a / b
+                            fps_source = "ffprobe_avg"
+                    except Exception:
+                        pass
+
+            # 3) Ultimo tentativo: OpenCV
+            if "fps" not in out:
+                est = _estimate_fps_via_opencv(ff.get("_input_path") or fmt.get("filename") or "")
+                if est and 1.0 < est < 240.0:
+                    out["fps"] = float(est)
+                    fps_source = "opencv_prop"  # o "opencv_ts" (non distinguiamo qui)
     except Exception:
         pass
+
+    if fps_source:
+        out["fps_source"] = fps_source
     return out
 
 def _enrich_meta_summary(meta: dict):
-    """Se manca meta['summary'].fps/width/height/duration/bit_rate, prova a ricavarli da ffprobe."""
+    """Se manca meta['summary'].fps/width/height/duration/bit_rate, prova a ricavarli da ffprobe + OpenCV."""
     if not isinstance(meta, dict):
         return
     summary = meta.get("summary")
@@ -276,10 +376,19 @@ def _enrich_meta_summary(meta: dict):
     if not summary:
         summary = {}
     need = any(k not in summary for k in ("width", "height", "fps", "duration", "bit_rate"))
+    # per permettere a _extract_video_summary_from_ffprobe di usare OpenCV,
+    # proviamo a inserire il filename nel dict ff (se non presente)
+    if isinstance(ff, dict) and "_input_path" not in ff:
+        try:
+            # meta_mod di solito non mette il filename; lo passiamo noi via campo privato
+            if meta.get("source_path"):
+                ff["_input_path"] = meta["source_path"]
+        except Exception:
+            pass
     if need and ff:
         fallback = _extract_video_summary_from_ffprobe(ff)
         for k, v in fallback.items():
-            if k not in summary:
+            if k not in summary and v is not None:
                 summary[k] = v
     meta["summary"] = summary
 
@@ -288,9 +397,12 @@ def _analyze_file(path: str, source_url: Optional[str] = None) -> Dict[str, Any]
     if meta_mod and hasattr(meta_mod, "get_media_meta"):
         meta = meta_mod.get_media_meta(path, source_url=source_url)
         ff = meta.get("ffprobe", {})
+        # memorizza per OpenCV fallback (vedi _enrich_meta_summary)
+        meta["source_path"] = path
     else:
         ff = _run_ffprobe_json(path)
-        meta = {"ffprobe": ff}
+        ff["_input_path"] = path
+        meta = {"ffprobe": ff, "source_path": path}
 
     # Enrich summary (FPS/size/duration/bitrate fallback)
     try:
