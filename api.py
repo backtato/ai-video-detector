@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from diskcache import Cache
@@ -23,13 +23,13 @@ DETECTOR_VERSION = os.getenv("DETECTOR_VERSION", "1.2.0")
 # CHANGED: default 100 MB; parametrico
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
 RESOLVER_MAX_BYTES = int(os.getenv("RESOLVER_MAX_BYTES", str(120 * 1024 * 1024)))
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]  # <— strip
-ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", "").strip()  # <— opzionale
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", "").strip()
 USE_YTDLP = os.getenv("USE_YTDLP", "1") not in ("0", "false", "False")
 RESOLVER_UA = os.getenv("RESOLVER_UA", "Mozilla/5.0 (compatible; AI-Video/1.0)")
 CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/aivideo-cache")
 
-# --- i18n minimale (puoi estendere) ---  # NEW
+# --- i18n minimale (puoi estendere) ---
 _I18N = {
     "it": {
         "err_provide_file": "Fornire un file.",
@@ -75,7 +75,6 @@ _I18N = {
 _DEFAULT_LANG = "it"
 
 def _negotiate_lang(request: Optional[Request]) -> str:
-    # 1) query ?lang=xx 2) X-Lang 3) Accept-Language 4) default
     try:
         if request is None:
             return _DEFAULT_LANG
@@ -84,7 +83,6 @@ def _negotiate_lang(request: Optional[Request]) -> str:
         xl = (request.headers.get("X-Lang") or "").split(",")[0].strip().lower()
         if xl in _I18N: return xl
         al = (request.headers.get("Accept-Language") or "").lower()
-        # es. "it-CH,it;q=0.9,en;q=0.8"
         for token in [t.split(";")[0].strip() for t in al.split(",") if t]:
             base = token.split("-")[0]
             if base in _I18N: return base
@@ -178,10 +176,8 @@ def _ytdlp_resolve_and_download(url: str) -> Tuple[str, str]:
             info = ydl.extract_info(url, download=True)
             if not info:
                 _raise_422("Download fallito.")
-            # trova file scaricato
             fn = ydl.prepare_filename(info)
             if not os.path.exists(fn):
-                # prova cercando nel tmpdir
                 cand = None
                 for root, _, files in os.walk(tmpdir):
                     for f in files:
@@ -240,7 +236,7 @@ def _analyze_path(path: str, source_url: Optional[str]=None, resolved_url: Optio
             "reasons": fusion.get("reasons") or [],
             "timeline": base_bins,
             "peaks": peaks,
-            "tips": tips,  # chiavi i18n che il frontend può tradurre, o backend può risolvere
+            "tips": tips,
         },
         "analysis_mode": "heuristic",
         "detector_version": DETECTOR_VERSION,
@@ -259,14 +255,35 @@ def healthz():
     return JSONResponse({"ok": ok, "ffprobe": ffprobe_ok, "exiftool": exiftool_ok,
                          "version": DETECTOR_VERSION, "author": __author__}, status_code=200 if ok else 500)
 
-# CHANGED: upload a chunk + i18n error messages
+# <<< NEW: catch-all OPTIONS per evitare 405 in preflight >>>
+@app.options("/{rest_of_path:path}")
+def any_options(rest_of_path: str):
+    # 204 No Content — CORS headers verranno aggiunti dal CORSMiddleware
+    return Response(status_code=204)
+
+# <<< NEW: endpoint diagnostico per CORS >>>
+@app.post("/cors-test")
+async def cors_test(request: Request):
+    hdrs = {k: v for k, v in request.headers.items()}
+    return JSONResponse({
+        "ok": True,
+        "seen_origin": hdrs.get("origin"),
+        "seen_access_control_request_method": hdrs.get("access-control-request-method"),
+        "seen_access_control_request_headers": hdrs.get("access-control-request-headers"),
+        "i_will_reply_to": ["GET","POST","OPTIONS"],
+        "allowed_by_env": {
+            "ALLOWED_ORIGINS": ALLOWED_ORIGINS,
+            "ALLOWED_ORIGIN_REGEX": ALLOWED_ORIGIN_REGEX or None
+        }
+    })
+
+# Upload a chunk + i18n error messages
 @app.post("/analyze")
 async def analyze(request: Request, file: UploadFile = File(...)):
     lang = _negotiate_lang(request)
     if not file:
         _raise_422(_t(lang, "err_provide_file"))
 
-    # cache by file hash is tricky without full read; usiamo temp+hash progressivo opzionale
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename or "upload")[1] or ".mp4")
     size = 0
     sha = hashlib.sha256()
@@ -288,11 +305,9 @@ async def analyze(request: Request, file: UploadFile = File(...)):
         key = "bytes:" + sha.hexdigest()
         cached = _disk_cached(key)
         if cached:
-            # risolvi eventuali tip i18n lato backend (opzionale)
             if isinstance(cached, dict) and "result" in cached and "tips" in cached["result"]:
-                cached_local = json.loads(json.dumps(cached))  # copia profonda
+                cached_local = json.loads(json.dumps(cached))
                 cached_local["i18n_lang"] = lang
-                # traduzione tips (chiavi) -> stringhe
                 if isinstance(cached_local["result"].get("tips"), list):
                     cached_local["result"]["tips"] = [
                         _t(lang, t) if t in (_I18N.get(lang) or {}) else t
@@ -302,7 +317,6 @@ async def analyze(request: Request, file: UploadFile = File(...)):
             return JSONResponse(cached)
 
         out = _analyze_path(tmp.name)
-        # applica i18n alle tips
         if isinstance(out.get("result", {}).get("tips"), list):
             out["i18n_lang"] = lang
             out["result"]["tips"] = [
@@ -312,7 +326,6 @@ async def analyze(request: Request, file: UploadFile = File(...)):
         _disk_store(key, out, expire=3600)
         return JSONResponse(out)
     finally:
-        # il file temp verrà comunque cancellato: qui lo lasciamo perché serve per timeline? No: già analizzato.
         try: os.remove(tmp.name)
         except: pass
 
