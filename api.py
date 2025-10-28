@@ -16,7 +16,7 @@ import subprocess
 from typing import Optional, Dict, Any
 
 import httpx
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -348,8 +348,11 @@ async def analyze(file: UploadFile = File(None), url: Optional[str] = Form(None)
 
 # ==== Analyze via URL (yt-dlp + fallback httpx) ====
 @app.post("/analyze-url")
-async def analyze_url(url: Optional[str] = Form(None), q: Optional[str] = Form(None),
-                      link: Optional[str] = Form(None), request: Optional[Request] = None):
+async def analyze_url(
+    url: Optional[str] = Form(None),
+    q: Optional[str] = Form(None),
+    link: Optional[str] = Form(None),
+):
     """
     Accetta url anche come 'q' o 'link' (retro-compat).
     Prova yt-dlp se abilitato; in caso di contenuto protetto/ratelimit → 422 con hint.
