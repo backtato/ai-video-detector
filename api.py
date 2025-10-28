@@ -152,9 +152,27 @@ def _download_via_httpx(url: str, dst_path: str, limit_bytes: int = RESOLVER_MAX
     return {"ok": True, "bytes": total, "content_type": ct}
 
 def _download_via_ytdlp(url: str, dst_dir: str) -> Dict[str, Any]:
-    # Scarica migliore variante avc + aac in file singolo se possibile (no cookie)
-    # Restituisce path file scaricato o errore
+    """
+    Scarica media con yt-dlp (senza cookie). Ritorna:
+      { ok, path?, error?, platform, warnings, needs_cookies, rate_limited, login_required }
+    """
     import yt_dlp
+    warnings = []
+    platform = "generic"
+
+    class _Logger:
+        def debug(self, msg):  # yt-dlp log verboso
+            pass
+        def info(self, msg):
+            # intercetta righe 'WARNING:' messe dentro info a volte
+            if isinstance(msg, str) and "WARNING:" in msg:
+                warnings.append(msg)
+        def warning(self, msg):
+            warnings.append(str(msg))
+        def error(self, msg):
+            warnings.append(f"ERROR: {msg}")
+
+    # best effort: mp4 se possibile; fallback best
     ydl_opts = {
         "outtmpl": os.path.join(dst_dir, "dl.%(ext)s"),
         "format": "mp4/bestaudio+bestvideo/best",
@@ -163,7 +181,58 @@ def _download_via_ytdlp(url: str, dst_dir: str) -> Dict[str, Any]:
         "nocheckcertificate": True,
         "retries": 2,
         "http_headers": {"User-Agent": USER_AGENT},
+        "logger": _Logger(),
     }
+
+    # piattaforma (solo per hint)
+    try:
+        if "instagram.com" in url:
+            platform = "instagram"
+        elif "youtube.com" in url or "youtu.be" in url:
+            platform = "youtube"
+        elif "tiktok.com" in url:
+            platform = "tiktok"
+        elif "facebook.com" in url:
+            platform = "facebook"
+    except Exception:
+        pass
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            fn = ydl.prepare_filename(info)
+            if os.path.exists(fn):
+                return {"ok": True, "path": fn, "platform": platform, "warnings": warnings,
+                        "needs_cookies": False, "rate_limited": False, "login_required": False}
+
+            # fallback: cerca qualsiasi file creato
+            for name in os.listdir(dst_dir):
+                p = os.path.join(dst_dir, name)
+                if name.startswith("dl.") and os.path.isfile(p):
+                    return {"ok": True, "path": p, "platform": platform, "warnings": warnings,
+                            "needs_cookies": False, "rate_limited": False, "login_required": False}
+
+            return {"ok": False, "error": "File non trovato dopo download",
+                    "platform": platform, "warnings": warnings,
+                    "needs_cookies": False, "rate_limited": False, "login_required": False}
+    except Exception as e:
+        msg = str(e)
+        needs_cookies = any(x in msg.lower() for x in [
+            "use --cookies", "cookies", "sign in", "login required", "confirm you’re not a bot",
+            "confirm you're not a bot", "adult content", "age-restricted"
+        ])
+        rate_limited = any(x in msg.lower() for x in [
+            "rate limit", "too many requests", "quota exceeded", "429", "temporary unavailable"
+        ])
+        login_required = any(x in msg.lower() for x in [
+            "login required", "private", "not available", "owner has restricted"
+        ])
+        return {"ok": False, "error": f"DownloadError yt-dlp: {msg}",
+                "platform": platform, "warnings": warnings,
+                "needs_cookies": needs_cookies,
+                "rate_limited": rate_limited,
+                "login_required": login_required}
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
