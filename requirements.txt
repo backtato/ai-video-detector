@@ -4,13 +4,11 @@ gunicorn
 python-multipart
 requests
 httpx
-
 numpy
 opencv-python-headless
 librosa
 soundfile
 onnxruntime
-
 pymediainfo
 hachoir
 diskcache
