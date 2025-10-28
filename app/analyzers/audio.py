@@ -25,27 +25,22 @@ def _norm(x: np.ndarray) -> np.ndarray:
     mn = float(np.min(x))
     ptp = float(np.ptp(x))
     if ptp == 0.0:
-        return np.zeros_like(x)
+        return np.zeros_like(x, dtype=float)
     return (x - mn) / ptp
 
-def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
+def analyze(path: str) -> Dict[str, Any]:
     """
-    Estrae feature audio e produce una timeline *per secondo*.
-    - Converte a WAV mono @target_sr
-    - Feature per frame-secondo: RMS, spectral flatness, ZCR
-    - Euristica *placeholder* per TTS/AI-like per-secondo
     Output:
-    {
       "scores": {"audio_mean": float, "tts_like": float, "hnr_proxy": float},
-      "flags_audio": [...],
+      "flags_audio": [str, ...],
       "timeline": [{"start":s, "end":e, "ai_score":float}, ...]
-    }
     """
-    wav = _extract_wav(path, sr=target_sr)
-    flags: List[str] = []
+    wav = _extract_wav(path, sr=16000)
     try:
-        y, sr = sf.read(wav, always_2d=False)
-        if y is None:
+        y, sr = sf.read(wav)  # già mono
+        flags: List[str] = []
+
+        if y is None or len(y) == 0:
             return {"scores": {"audio_mean": 0.5, "tts_like": 0.0, "hnr_proxy": 0.0},
                     "flags_audio": ["no_audio"], "timeline": []}
         if isinstance(y, np.ndarray) and y.ndim > 1:
@@ -92,16 +87,12 @@ def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
         hnr_proxy = float(1.0 - (float(np.mean(flat_n)) if flat_n.size else 0.0))
 
         # ---- Heuristica per-secondo (evita broadcasting errori) ----
-        # ai_i = 0.4*flat_n + 0.35*(1 - rms_n) + 0.15*(1 - rms_std) + 0.10*(1 - zcr_std)
-        # dove rms_std e zcr_std sono scalari.
         ai_per_sec = (
-            0.4 * flat_n +
+            0.40 * flat_n +
             0.35 * (1.0 - rms_n) +
-            0.15 * (1.0 - rms_std) +
-            0.10 * (1.0 - zcr_std)
+            0.15 * (1.0 - min(1.0, max(0.0, rms_std))) +
+            0.10 * (1.0 - min(1.0, max(0.0, zcr_std)))
         )
-        ai_per_sec = np.asarray(ai_per_sec, dtype=float)
-        ai_per_sec = np.clip(ai_per_sec, 0.0, 1.0)
 
         # Flag semplici
         energy_mean   = float(np.mean(rms)) if rms.size else 0.0
@@ -131,9 +122,28 @@ def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
             for i in range(n_bins)
         ]
 
+        # Warm-up: neutralizza il primo secondo
+        if len(timeline) >= 1:
+            timeline[0]["ai_score"] = 0.5
+
+        # Smoothing 3-punti
+        if len(timeline) >= 3:
+            sm = []
+            for i in range(len(timeline)):
+                lo = max(0, i-1); hi = min(len(timeline)-1, i+1)
+                sm.append({"start": timeline[i]["start"], "end": timeline[i]["end"],
+                           "ai_score": float(np.mean([timeline[j]["ai_score"] for j in range(lo,hi+1)]))})
+            timeline = sm
+
+        # Flags più severi
+        if float(np.mean(flat_n)) >= 0.55 if flat_n.size else False:
+            flags.append("tts_like")
+        if float(np.mean(rms_n)) <= 0.05 if rms_n.size else False:
+            flags.append("very_low_energy")
+
         return {
             "scores": {
-                "audio_mean": float(np.mean(per_frames)) if per_frames else 0.5,
+                "audio_mean": float(np.mean([t["ai_score"] for t in timeline])) if timeline else 0.5,
                 "tts_like": float(np.mean(flat_n)) if flat_n.size else 0.0,
                 "hnr_proxy": hnr_proxy,
             },
