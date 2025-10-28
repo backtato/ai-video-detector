@@ -164,7 +164,6 @@ def _download_via_ytdlp(url: str, dst_dir: str) -> Dict[str, Any]:
         def debug(self, msg):  # yt-dlp log verboso
             pass
         def info(self, msg):
-            # intercetta righe 'WARNING:' messe dentro info a volte
             if isinstance(msg, str) and "WARNING:" in msg:
                 warnings.append(msg)
         def warning(self, msg):
@@ -172,7 +171,6 @@ def _download_via_ytdlp(url: str, dst_dir: str) -> Dict[str, Any]:
         def error(self, msg):
             warnings.append(f"ERROR: {msg}")
 
-    # best effort: mp4 se possibile; fallback best
     ydl_opts = {
         "outtmpl": os.path.join(dst_dir, "dl.%(ext)s"),
         "format": "mp4/bestaudio+bestvideo/best",
@@ -204,22 +202,21 @@ def _download_via_ytdlp(url: str, dst_dir: str) -> Dict[str, Any]:
             if os.path.exists(fn):
                 return {"ok": True, "path": fn, "platform": platform, "warnings": warnings,
                         "needs_cookies": False, "rate_limited": False, "login_required": False}
-
             # fallback: cerca qualsiasi file creato
             for name in os.listdir(dst_dir):
                 p = os.path.join(dst_dir, name)
                 if name.startswith("dl.") and os.path.isfile(p):
                     return {"ok": True, "path": p, "platform": platform, "warnings": warnings,
                             "needs_cookies": False, "rate_limited": False, "login_required": False}
-
             return {"ok": False, "error": "File non trovato dopo download",
                     "platform": platform, "warnings": warnings,
                     "needs_cookies": False, "rate_limited": False, "login_required": False}
     except Exception as e:
         msg = str(e)
         needs_cookies = any(x in msg.lower() for x in [
-            "use --cookies", "cookies", "sign in", "login required", "confirm you’re not a bot",
-            "confirm you're not a bot", "adult content", "age-restricted"
+            "use --cookies", "cookies", "sign in", "login required",
+            "confirm you’re not a bot", "confirm you're not a bot",
+            "adult content", "age-restricted"
         ])
         rate_limited = any(x in msg.lower() for x in [
             "rate limit", "too many requests", "quota exceeded", "429", "temporary unavailable"
@@ -232,21 +229,6 @@ def _download_via_ytdlp(url: str, dst_dir: str) -> Dict[str, Any]:
                 "needs_cookies": needs_cookies,
                 "rate_limited": rate_limited,
                 "login_required": login_required}
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            fn = ydl.prepare_filename(info)
-            # yt-dlp può dare estensioni diverse, normalizziamo se possibile
-            if os.path.exists(fn):
-                return {"ok": True, "path": fn}
-            # fallback: cerca file creati
-            for name in os.listdir(dst_dir):
-                if name.startswith("dl.") and os.path.isfile(os.path.join(dst_dir, name)):
-                    return {"ok": True, "path": os.path.join(dst_dir, name)}
-            return {"ok": False, "error": "File non trovato dopo download"}
-    except Exception as e:
-        return {"ok": False, "error": f"DownloadError yt-dlp: {e}"}
 
 # === Fallback meta summary (FPS/size/duration/bitrate) ===
 
@@ -413,11 +395,25 @@ async def analyze_url(request: Request, url: Optional[str] = Form(None)):
                 path = ytd["path"]
                 used = "yt-dlp"
             else:
-                # fallback httpx
+                # mappa errori noti in 422 con hint specifici
+                plat = ytd.get("platform", "generic")
+                if ytd.get("needs_cookies") or ytd.get("login_required"):
+                    _unprocessable("Contenuto protetto o con restrizioni (autenticazione richiesta).", {
+                        "platform": plat,
+                        "hint": "Il contenuto richiede login/cookie. Usa 'Carica file' o 'Registra 10s e carica'."
+                    })
+                if ytd.get("rate_limited"):
+                    _unprocessable("Sorgente ha applicato un rate limit (anti-bot).", {
+                        "platform": plat,
+                        "hint": "Riprova più tardi o usa 'Carica file' / 'Registra 10s e carica'."
+                    })
+                # fallback httpx per URL diretti
                 dl = _download_via_httpx(the_url, path, RESOLVER_MAX_BYTES)
                 if not dl.get("ok"):
-                    _unprocessable(dl.get("error", "Impossibile scaricare il media"),
-                                   {"hint": "Se è protetto/login-wall, usa Carica file o Registra 10s"})
+                    _unprocessable(dl.get("error", "Impossibile scaricare il media"), {
+                        "platform": plat,
+                        "hint": "Se è un link social protetto/login-wall, usa 'Carica file' o 'Registra 10s e carica'."
+                    })
                 used = "httpx"
         else:
             dl = _download_via_httpx(the_url, path, RESOLVER_MAX_BYTES)
@@ -431,9 +427,13 @@ async def analyze_url(request: Request, url: Optional[str] = Form(None)):
                            {"resolver": used})
 
         res = _analyze_file(path, source_url=the_url)
-        # Aggiungi info resolver
         res.setdefault("tips", {})
         res["tips"]["resolver"] = used
+        if 'ytd' in locals() and isinstance(ytd, dict):
+            if ytd.get("warnings"):
+                res["tips"]["ytdlp_warnings"] = ytd["warnings"][:5]
+            if ytd.get("platform"):
+                res["tips"]["platform"] = ytd["platform"]
         return JSONResponse(res)
 
     finally:
