@@ -15,12 +15,13 @@ import json
 import httpx
 import mimetypes
 
-from app.analyzers import video as video_an
-from app.analyzers import audio as audio_an
-from app.analyzers import meta  as meta_an
-from app.analyzers import forensic as forensic_an
-from app.analyzers import fusion as fusion_an
-from app.analyzers import heuristics_v2 as heur_an
+import app.analyzers.video         as video_an
+import app.analyzers.audio         as audio_an
+import app.analyzers.meta          as meta_an
+import app.analyzers.forensic      as forensic_an
+import app.analyzers.fusion        as fusion_an
+import app.analyzers.heuristics_v2 as heur_an
+
 
 # ==== ENV / CONFIG ==========================================================
 MAX_UPLOAD_BYTES     = int(os.getenv("MAX_UPLOAD_BYTES",      str(100 * 1024 * 1024)))  # 100MB
