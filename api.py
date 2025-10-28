@@ -179,6 +179,59 @@ def _download_via_ytdlp(url: str, dst_dir: str) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"DownloadError yt-dlp: {e}"}
 
+# === Fallback meta summary (FPS/size/duration/bitrate) ===
+
+def _extract_video_summary_from_ffprobe(ff: dict) -> dict:
+    """Fallback: crea un summary con width/height/fps/duration/bit_rate da ffprobe."""
+    out = {}
+    try:
+        fmt = ff.get("format", {}) if isinstance(ff, dict) else {}
+        if "bit_rate" in fmt:
+            try:
+                out["bit_rate"] = int(fmt["bit_rate"])
+            except Exception:
+                pass
+        if "duration" in fmt:
+            try:
+                out["duration"] = float(fmt["duration"])
+            except Exception:
+                pass
+        vstreams = [s for s in ff.get("streams", []) if s.get("codec_type") == "video"]
+        if vstreams:
+            vs = vstreams[0]
+            w = vs.get("width")
+            h = vs.get("height")
+            if w: out["width"] = int(w)
+            if h: out["height"] = int(h)
+            r_fps = vs.get("r_frame_rate") or vs.get("avg_frame_rate")
+            if isinstance(r_fps, str) and "/" in r_fps:
+                try:
+                    a, b = r_fps.split("/")
+                    a, b = int(a), int(b)
+                    if b != 0:
+                        out["fps"] = float(a) / float(b)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+def _enrich_meta_summary(meta: dict):
+    """Se manca meta['summary'].fps/width/height/duration/bit_rate, prova a ricavarli da ffprobe."""
+    if not isinstance(meta, dict):
+        return
+    summary = meta.get("summary")
+    ff = meta.get("ffprobe", {})
+    if not summary:
+        summary = {}
+    need = any(k not in summary for k in ("width", "height", "fps", "duration", "bit_rate"))
+    if need and ff:
+        fallback = _extract_video_summary_from_ffprobe(ff)
+        for k, v in fallback.items():
+            if k not in summary:
+                summary[k] = v
+    meta["summary"] = summary
+
 def _analyze_file(path: str, source_url: Optional[str] = None) -> Dict[str, Any]:
     # 1) Meta
     if meta_mod and hasattr(meta_mod, "get_media_meta"):
@@ -187,6 +240,12 @@ def _analyze_file(path: str, source_url: Optional[str] = None) -> Dict[str, Any]
     else:
         ff = _run_ffprobe_json(path)
         meta = {"ffprobe": ff}
+
+    # Enrich summary (FPS/size/duration/bitrate fallback)
+    try:
+        _enrich_meta_summary(meta)
+    except Exception:
+        pass
 
     if not _has_av_streams(ff):
         _bad_request("Unsupported or empty media: no audio/video streams found",
@@ -257,8 +316,21 @@ async def analyze(file: UploadFile = File(...)):
             pass
 
 @app.post("/analyze-url")
-async def analyze_url(url: str = Form(...)):
-    if not url or not re.match(r"^https?://", url):
+async def analyze_url(request: Request, url: Optional[str] = Form(None)):
+    # Accetta FormData, JSON o query (?url= / ?link= / ?q=)
+    the_url = url
+    if not the_url:
+        try:
+            if request.headers.get("content-type", "").startswith("application/json"):
+                data = await request.json()
+                the_url = data.get("url") or data.get("link") or data.get("q")
+        except Exception:
+            pass
+    if not the_url:
+        qs = dict(request.query_params)
+        the_url = qs.get("url") or qs.get("link") or qs.get("q")
+
+    if not the_url or not re.match(r"^https?://", the_url):
         _bad_request("URL non valido")
 
     tmpdir = tempfile.mkdtemp(prefix="aivdl_")
@@ -267,19 +339,19 @@ async def analyze_url(url: str = Form(...)):
 
     try:
         if USE_YTDLP:
-            ytd = _download_via_ytdlp(url, tmpdir)
+            ytd = _download_via_ytdlp(the_url, tmpdir)
             if ytd.get("ok"):
                 path = ytd["path"]
                 used = "yt-dlp"
             else:
                 # fallback httpx
-                dl = _download_via_httpx(url, path, RESOLVER_MAX_BYTES)
+                dl = _download_via_httpx(the_url, path, RESOLVER_MAX_BYTES)
                 if not dl.get("ok"):
                     _unprocessable(dl.get("error", "Impossibile scaricare il media"),
                                    {"hint": "Se è protetto/login-wall, usa Carica file o Registra 10s"})
                 used = "httpx"
         else:
-            dl = _download_via_httpx(url, path, RESOLVER_MAX_BYTES)
+            dl = _download_via_httpx(the_url, path, RESOLVER_MAX_BYTES)
             if not dl.get("ok"):
                 _unprocessable(dl.get("error", "Impossibile scaricare il media"),
                                {"hint": "Se è protetto/login-wall, usa Carica file o Registra 10s"})
@@ -289,7 +361,7 @@ async def analyze_url(url: str = Form(...)):
             _unprocessable("Download completato ma file mancante o vuoto",
                            {"resolver": used})
 
-        res = _analyze_file(path, source_url=url)
+        res = _analyze_file(path, source_url=the_url)
         # Aggiungi info resolver
         res.setdefault("tips", {})
         res["tips"]["resolver"] = used
@@ -320,13 +392,39 @@ async def analyze_link(link: str = Form(...)):
     })
 
 @app.post("/predict")
-async def predict(
-    file: UploadFile = File(None),
-    url: Optional[str] = Form(None),
-):
-    # Retro-compatibilità: se c'è file → /analyze; se c'è url → /analyze-url
-    if file:
-        return await analyze(file=file)
-    if url:
-        return await analyze_url(url=url)
+async def predict(request: Request, file: UploadFile = File(None), url: Optional[str] = Form(None)):
+    """
+    Retro-compatibilità:
+    - se c'è un file NON VUOTO -> /analyze
+    - altrimenti prova a prendere l'URL da Form, JSON o query -> /analyze-url
+    """
+    # 1) Se è presente un file, verifichiamo che non sia vuoto
+    if file and getattr(file, "filename", None):
+        try:
+            peek = await file.read(16)
+            await file.seek(0)
+        except Exception:
+            peek = None
+        if peek:
+            return await analyze(file=file)
+        # se è vuoto, ignoriamo il file e proviamo l'URL
+
+    # 2) URL da Form
+    the_url = url
+    # 3) Fallback JSON
+    if not the_url:
+        try:
+            if request.headers.get("content-type", "").startswith("application/json"):
+                data = await request.json()
+                the_url = data.get("url") or data.get("link") or data.get("q")
+        except Exception:
+            pass
+    # 4) Fallback querystring
+    if not the_url:
+        qs = dict(request.query_params)
+        the_url = qs.get("url") or qs.get("link") or qs.get("q")
+
+    if the_url:
+        return await analyze_url(request=request, url=the_url)
+
     _bad_request("Nessun file o URL fornito")
