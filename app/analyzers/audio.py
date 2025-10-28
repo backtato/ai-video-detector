@@ -1,108 +1,117 @@
 # app/analyzers/audio.py
-# Estensione: spectral flatness, MFCC variance, HNR proxy, timeline per secondo.
-# Mantiene compatibilità: ritorna scores.audio_mean + timeline; aggiunge campi utili.
-
 import os
-import subprocess
 import tempfile
+import subprocess
+from typing import Dict, Any, List, Optional
+
 import numpy as np
+import soundfile as sf
 import librosa
 
-def _extract_wav(in_path: str, target_sr: int = 16000) -> str:
-    """Estrae un WAV mono 16k con ffmpeg. Ritorna path temporaneo."""
-    tmpdir = tempfile.mkdtemp(prefix="aiv_audio_")
-    out_wav = os.path.join(tmpdir, "audio.wav")
-    cmd = [
-        "ffmpeg", "-y", "-i", in_path,
-        "-ac", "1", "-ar", str(target_sr),
-        "-vn", out_wav
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    return out_wav
+def _run(cmd: list) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True)
 
-def analyze(path: str, target_sr: int = 16000) -> dict:
-    wav = None
+def _extract_wav(path: str, sr: int = 16000) -> str:
+    tmp = tempfile.mkdtemp(prefix="aud_")
+    out = os.path.join(tmp, "audio.wav")
+    # mono, target sr
+    _run(["ffmpeg","-hide_banner","-v","error","-i", path, "-ac","1","-ar",str(sr), out])
+    return out
+
+def _norm(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    if x.size == 0:
+        return x
+    mn = np.min(x)
+    ptp = np.ptp(x)
+    if ptp == 0:
+        return np.zeros_like(x)
+    return (x - mn) / ptp
+
+def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
+    """
+    Estrae feature audio e produce una timeline *per secondo*.
+    - Converte a WAV mono @target_sr
+    - Feature: RMS (energia), spectral flatness, ZCR
+    - Euristica *placeholder* per TTS/AI-like per-secondo
+    Restituisce:
+    {
+      "scores": {"audio_mean": float, "tts_like": float, "hnr_proxy": float},
+      "flags_audio": [...],
+      "timeline": [{"start":s, "end":e, "ai_score":float}, ...]
+    }
+    """
+    wav = _extract_wav(path, sr=target_sr)
+    flags: List[str] = []
     try:
-        wav = _extract_wav(path, target_sr=target_sr)
-        if not os.path.exists(wav) or os.path.getsize(wav) == 0:
-            return {"error": "audio_extract_failed"}
+        # Carica segnale
+        y, sr = sf.read(wav, always_2d=False)
+        if y is None or (isinstance(y, np.ndarray) and y.size == 0):
+            return {"scores": {"audio_mean": 0.5, "tts_like": 0.0, "hnr_proxy": 0.0}, "flags_audio": ["no_audio"], "timeline": []}
+        if isinstance(y, np.ndarray) and y.ndim > 1:
+            y = np.mean(y, axis=1)
+        y = np.asarray(y, dtype=np.float32)
 
-        # Caricamento librosa
-        y, sr = librosa.load(wav, sr=target_sr, mono=True)
-        if y.size == 0 or sr <= 0:
-            return {"error": "audio_empty"}
+        duration = float(len(y)) / float(sr) if sr > 0 else 0.0
+        if duration <= 0.0:
+            return {"scores": {"audio_mean": 0.5, "tts_like": 0.0, "hnr_proxy": 0.0}, "flags_audio": ["no_audio"], "timeline": []}
 
-        # Parametri finestra classici speech
-        frame_length = int(0.025 * sr)  # 25 ms
-        hop_length = int(0.010 * sr)    # 10 ms
+        # Parametri finestra/hop per timeline 1s
+        win = sr
+        hop = sr
 
-        rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-        zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame_length, hop_length=hop_length)[0]
-        centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
-        flatness = librosa.feature.spectral_flatness(y=y, hop_length=hop_length)[0]
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop_length)
-        mfcc_var = np.var(mfcc, axis=1).mean()  # variabilità media MFCC
+        # Feature per frame-secondo
+        rms = librosa.feature.rms(y=y, frame_length=win, hop_length=hop, center=False)[0]
+        # Evita FFT più grande del segnale
+        n_fft = 2048 if sr >= 2048 else max(512, int(sr/2))
+        flatness = librosa.feature.spectral_flatness(y=y, n_fft=n_fft, hop_length=hop, win_length=min(n_fft, win), center=False)[0]
+        zcr = librosa.feature.zero_crossing_rate(y, frame_length=win, hop_length=hop, center=False)[0]
 
-        # HNR proxy: energia banda bassa vs totale
-        S = np.abs(librosa.stft(y, n_fft=1024, hop_length=hop_length)) + 1e-9
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=1024)
-        low_band = S[(freqs <= 3000), :]
-        hnr_proxy = float(np.mean(low_band) / np.mean(S))
+        # Normalizzazioni e statistiche
+        rms_n  = _norm(rms)
+        flat_n = _norm(flatness)
+        zcr_n  = _norm(zcr)
 
-        # Normalizzazione robusta → sigmoide
-        def rn(x):
-            x = np.asarray(x, dtype=np.float32)
-            if x.size == 0:
-                return x
-            xm, xs = float(x.mean()), float(x.std() or 1.0)
-            z = (x - xm) / xs
-            return 1.0 / (1.0 + np.exp(-z))
+        # Variabilità (prosodia/intonazione proxy) – std globali normalizzati
+        rms_std = float(np.std(rms_n)) if rms_n.size else 0.0
+        zcr_std = float(np.std(zcr_n)) if zcr_n.size else 0.0
 
-        rms_n = rn(rms)
-        zcr_n = rn(zcr)
-        flat_n = rn(flatness)
-        cent_n = rn(centroid)
+        # Proxy HNR rozzo (1 - flatness media normalizzata)
+        hnr_proxy = float(1.0 - float(np.mean(flat_n)) if flat_n.size else 0.0)
 
-        # Euristica TTS/AI: bassa varianza MFCC + flatness alta + HNR basso
-        tts_like = float(
-            0.4 * (1.0 - np.tanh(mfcc_var / 50.0)) +
-            0.3 * float(np.mean(flat_n)) +
-            0.3 * (1.0 - np.tanh(hnr_proxy))
-        )
+        # Heuristica TTS/AI-like per secondo:
+        # maggiore flatness + bassa variabilità/energia → più “AI-like”
+        ai_per_sec = 0.4*flat_n + 0.35*(1.0 - rms_n) + 0.15*(1.0 - rms_std) + 0.10*(1.0 - zcr_std)
+        ai_per_sec = np.clip(ai_per_sec, 0.0, 1.0)
 
-        # Score complessivo audio (conservativo)
-        per_sec_ai = np.clip(
-            0.35 * (1.0 - np.maximum(rms_n, zcr_n)) +
-            0.35 * tts_like +
-            0.30 * (1.0 - np.tanh(np.std(cent_n))), 0.0, 1.0
-        )
-        score = float(np.mean(per_sec_ai)) if per_sec_ai.size else 0.5
-
-        # Flags
-        flags = []
-        if float(np.mean(rms)) < 0.01:
+        # Flag semplici
+        energy_mean    = float(np.mean(rms)) if rms.size else 0.0
+        silence_ratio  = float(np.mean(rms < (np.median(rms)*0.3 + 1e-9))) if rms.size else 1.0
+        if silence_ratio > 0.7:
+            flags.append("mostly_silent")
+        if energy_mean < 1e-3:
             flags.append("very_low_energy")
-        if float(np.mean(flatness)) > 0.35:
-            flags.append("flat_spectrum")
-        if tts_like > 0.6:
-            flags.append("tts_like")
 
-        # Timeline per secondo (fino a 180s max per coerenza)
-        duration = len(y)/sr if sr > 0 else 0.0
-        n_bins = max(int(duration), 1)
-        if n_bins > 180:
-            n_bins = 180
-        timeline = [{"start": float(i), "end": float(i+1), "ai_score": float(score)} for i in range(n_bins)]
+        # Timeline per-secondo (limite di sicurezza 180s)
+        n_bins = int(np.ceil(duration))
+        n_bins = max(1, min(n_bins, 180))
+        timeline: List[Dict[str, float]] = []
+        for i in range(n_bins):
+            score = float(ai_per_sec[i]) if i < ai_per_sec.size else float(np.mean(ai_per_sec)) if ai_per_sec.size else 0.5
+            timeline.append({"start": float(i), "end": float(i+1), "ai_score": score})
 
         return {
-            "scores": {"audio_mean": score, "tts_like": tts_like, "hnr_proxy": hnr_proxy},
+            "scores": {
+                "audio_mean": float(np.mean(ai_per_sec)) if ai_per_sec.size else 0.5,
+                "tts_like": float(np.mean(flat_n)) if flat_n.size else 0.0,
+                "hnr_proxy": hnr_proxy,
+            },
             "flags_audio": flags,
             "timeline": timeline
         }
-
-    except Exception as e:
-        return {"error": f"audio_analyze_error: {e}"}
     finally:
-        # Non rimuoviamo i file temporanei in modo aggressivo per debugging;
-        # se vuoi, abilita una pulizia condizionale.
-        pass
+        try:
+            os.remove(wav)
+            os.rmdir(os.path.dirname(wav))
+        except Exception:
+            pass
