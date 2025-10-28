@@ -170,4 +170,17 @@ def analyze(path: str, max_seconds: float = 30.0, fps: float = 2.5) -> dict:
             "optflow_mag_avg": float(np.mean(flow_mag_means)) if len(flow_mag_means) else 0.0
         }
     }
+    timeline_ai = []
+    for i, sec in enumerate(timeline):
+        dup  = float(sec.get("dup", 0.0))
+        blk  = float(sec.get("blockiness", 0.0))
+        band = float(sec.get("banding", 0.0))
+        mot  = float(sec.get("motion", 0.0))
+        blk_n  = max(0.0, min(1.0, blk*8.0))
+        band_n = max(0.0, min(1.0, (band-0.45)*10.0))
+        mot_n  = max(0.0, min(1.0, mot/40.0))
+        v_ai = 0.25*dup + 0.25*blk_n + 0.20*band_n + 0.30*(1.0 - mot_n)
+        timeline_ai.append({"start": int(sec.get("start", i)), "end": int(sec.get("end", i+1)), "ai_score": float(max(0.0, min(1.0, v_ai)))})
+    stats["timeline_ai"] = timeline_ai
+
     return stats
