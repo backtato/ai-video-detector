@@ -1,376 +1,332 @@
-# api.py
-import os, io, json, shutil, tempfile, traceback, hashlib
-from typing import Optional, Tuple
-from urllib.parse import urlparse
+import os
+import io
+import re
+import json
+import shutil
+import tempfile
+import traceback
+import subprocess
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from diskcache import Cache
-from yt_dlp import YoutubeDL
-
-from app.analyzers.meta import extract_metadata, detect_c2pa, detect_device_fingerprint
-from app.analyzers.video import analyze_video
-from app.analyzers.audio import analyze_audio
-from app.fusion import fuse_scores, finalize_with_timeline, _bin_timeline, build_hints
-
-__author__ = "Backtato"  # NEW
-
-APP_NAME = "AI-Video Detector"
-DETECTOR_VERSION = os.getenv("DETECTOR_VERSION", "1.2.0")
-
-# CHANGED: default 100 MB; parametrico
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+# === Config da ENV ===
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))  # 100MB
 RESOLVER_MAX_BYTES = int(os.getenv("RESOLVER_MAX_BYTES", str(120 * 1024 * 1024)))
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", "").strip()
-USE_YTDLP = os.getenv("USE_YTDLP", "1") not in ("0", "false", "False")
-RESOLVER_UA = os.getenv("RESOLVER_UA", "Mozilla/5.0 (compatible; AI-Video/1.0)")
-CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/aivideo-cache")
+REQUEST_TIMEOUT_S = int(os.getenv("REQUEST_TIMEOUT_S", "120"))
+USE_YTDLP = os.getenv("USE_YTDLP", "1") not in ("0", "false", "False", "")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", "")
 
-# --- i18n minimale (puoi estendere) ---
-_I18N = {
-    "it": {
-        "err_provide_file": "Fornire un file.",
-        "err_too_big": "File troppo grande (>{limit_mb} MB). Taglia o usa 'Registra 10s'.",
-        "err_provide_url": "Fornire 'url'.",
-        "err_use_analyze_url": "Usa /analyze-url per i link, oppure /analyze con 'file'.",
-        "err_protected": "Contenuto protetto o login richiesto. Suggerimento: usa 'Carica file' o 'Registra 10s'.",
-        "tip_uncertain": "Esito incerto: prova un video più lungo o di qualità migliore.",
-        "tip_no_c2pa": "Nessuna firma C2PA rilevata (non prova di falsità).",
-        "tip_audio_pauses": "Audio con molte pause o a bassa energia."
-    },
-    "en": {
-        "err_provide_file": "Please provide a file.",
-        "err_too_big": "File too large (>{limit_mb} MB). Trim or use 'Record 10s'.",
-        "err_provide_url": "Provide 'url'.",
-        "err_use_analyze_url": "Use /analyze-url for links, or /analyze with 'file'.",
-        "err_protected": "Protected content or login required. Tip: use 'Upload file' or 'Record 10s'.",
-        "tip_uncertain": "Uncertain result: try a longer or higher-quality video.",
-        "tip_no_c2pa": "No C2PA signature detected (not proof of falsity).",
-        "tip_audio_pauses": "Audio with long pauses or low energy."
-    },
-    "fr": {
-        "err_provide_file": "Veuillez fournir un fichier.",
-        "err_too_big": "Fichier trop volumineux (>{limit_mb} Mo). Coupez-le ou utilisez 'Enregistrer 10s'.",
-        "err_provide_url": "Fournissez 'url'.",
-        "err_use_analyze_url": "Utilisez /analyze-url pour les liens, ou /analyze avec 'file'.",
-        "err_protected": "Contenu protégé ou connexion requise. Astuce : 'Téléverser un fichier' ou 'Enregistrer 10s'.",
-        "tip_uncertain": "Résultat incertain : essayez une vidéo plus longue ou de meilleure qualité.",
-        "tip_no_c2pa": "Aucune signature C2PA détectée (pas une preuve de falsification).",
-        "tip_audio_pauses": "Audio avec de longues pauses ou faible énergie."
-    },
-    "de": {
-        "err_provide_file": "Bitte eine Datei bereitstellen.",
-        "err_too_big": "Datei zu groß (>{limit_mb} MB). Kürzen oder '10s aufnehmen' verwenden.",
-        "err_provide_url": "'url' angeben.",
-        "err_use_analyze_url": "Für Links /analyze-url nutzen oder /analyze mit 'file'.",
-        "err_protected": "Geschützter Inhalt oder Anmeldung erforderlich. Tipp: 'Datei hochladen' oder '10s aufnehmen'.",
-        "tip_uncertain": "Unklarer Befund: Versuchen Sie ein längeres oder qualitativ besseres Video.",
-        "tip_no_c2pa": "Keine C2PA-Signatur erkannt (kein Beweis für Fälschung).",
-        "tip_audio_pauses": "Audio mit vielen Pausen oder geringer Energie."
-    }
-}
-_DEFAULT_LANG = "it"
+# === App ===
+app = FastAPI(title="AI-Video Backend", version="1.1.3", docs_url=None, redoc_url=None)
 
-def _negotiate_lang(request: Optional[Request]) -> str:
-    try:
-        if request is None:
-            return _DEFAULT_LANG
-        q = (request.query_params.get("lang") or "").strip().lower()
-        if q in _I18N: return q
-        xl = (request.headers.get("X-Lang") or "").split(",")[0].strip().lower()
-        if xl in _I18N: return xl
-        al = (request.headers.get("Accept-Language") or "").lower()
-        for token in [t.split(";")[0].strip() for t in al.split(",") if t]:
-            base = token.split("-")[0]
-            if base in _I18N: return base
-    except:
-        pass
-    return _DEFAULT_LANG
-
-def _t(lang: str, key: str, **kw) -> str:
-    s = (_I18N.get(lang) or {}).get(key) or (_I18N[_DEFAULT_LANG].get(key) or key)
-    if kw:
-        try: return s.format(**kw)
-        except: return s
-    return s
-
-os.makedirs(CACHE_DIR, exist_ok=True)
-cache = Cache(CACHE_DIR)
-
-DEFAULT_YTDLP_OPTS = {
-    "noplaylist": True,
-    "continuedl": False,
-    "retries": 1,
-    "quiet": True,
-}
-
-ALLOW_DOMAINS = {
-    "youtube.com","www.youtube.com","youtu.be",
-    "vimeo.com","www.vimeo.com",
-    "instagram.com","www.instagram.com",
-    "tiktok.com","www.tiktok.com",
-    "facebook.com","www.facebook.com","fb.watch",
-    "x.com","www.x.com","twitter.com","www.twitter.com",
-}
-
-app = FastAPI(title=APP_NAME, version=DETECTOR_VERSION)
-
-# --- CORS robusto: lista o regex, headers esposti, preflight ---
-cors_common = dict(
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["X-Detected-Lang", "X-Request-Id"]
-)
-if ALLOWED_ORIGIN_REGEX:
+# CORS
+if ALLOWED_ORIGINS or ALLOWED_ORIGIN_REGEX:
     app.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=ALLOWED_ORIGIN_REGEX,
-        **cors_common
+        allow_origins=[o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()] if ALLOWED_ORIGINS else [],
+        allow_origin_regex=ALLOWED_ORIGIN_REGEX or None,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 else:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
-        **cors_common
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
-def _raise_422(msg: str):
-    raise HTTPException(status_code=422, detail=msg)
+# === Import moduli di analisi ===
+try:
+    from app.analyzers import meta as meta_mod
+except Exception:
+    meta_mod = None
 
-def _is_allowed_url(url: str) -> bool:
+try:
+    from app.analyzers import audio as audio_mod
+except Exception:
+    audio_mod = None
+
+try:
+    from app.analyzers import video as video_mod
+except Exception:
+    video_mod = None
+
+try:
+    from app.analyzers import heuristics_v2 as heur_v2
+except Exception:
+    heur_v2 = None
+
+try:
+    from app import fusion as fusion_mod
+except Exception:
+    fusion_mod = None
+
+# === Utils ===
+
+USER_AGENT = "Mozilla/5.0 (AI-Video/1.1.3; +https://greensovereignfund.ch)"
+
+def _bad_request(msg: str, extra: Dict[str, Any] = None):
+    payload = {"detail": {"error": msg}}
+    if extra:
+        payload["detail"].update(extra)
+    raise HTTPException(status_code=415, detail=payload["detail"])
+
+def _unprocessable(msg: str, extra: Dict[str, Any] = None):
+    payload = {"detail": {"error": msg}}
+    if extra:
+        payload["detail"].update(extra)
+    raise HTTPException(status_code=422, detail=payload["detail"])
+
+def _save_upload_to_temp(up: UploadFile) -> str:
+    suffix = os.path.splitext(up.filename or "")[-1] or ".bin"
+    tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    total = 0
     try:
-        u = urlparse(url)
-        return u.scheme in ("http", "https") and any((u.netloc or "").lower().endswith(d) for d in ALLOW_DOMAINS)
-    except:
-        return False
+        while True:
+            chunk = up.file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                up.file.close()
+                tmpf.close()
+                os.unlink(tmpf.name)
+                _bad_request("File troppo grande", {"max_upload_bytes": MAX_UPLOAD_BYTES})
+            tmpf.write(chunk)
+    finally:
+        up.file.close()
+        tmpf.flush()
+        tmpf.close()
+    if total == 0:
+        _bad_request("File vuoto o non ricevuto")
+    return tmpf.name
 
-def _file_hash(b: bytes) -> str:
-    h = hashlib.sha256(); h.update(b); return h.hexdigest()
-
-def _disk_cached(key: str) -> Optional[dict]:
-    try: return cache.get(key)
-    except: return None
-
-def _disk_store(key: str, value: dict, expire: int = 3600):
-    try: cache.set(key, value, expire=expire)
-    except: pass
-
-def _ytdlp_resolve_and_download(url: str) -> Tuple[str, str]:
-    opts = dict(DEFAULT_YTDLP_OPTS)
-    tmpdir = tempfile.mkdtemp()
-    outtmpl = os.path.join(tmpdir, "%(title).80s.%(ext)s")
-    opts.update({
-        "outtmpl": outtmpl,
-        "restrictfilenames": True,
-        "nopart": True,
-        "ignoreerrors": False,
-        "user_agent": RESOLVER_UA,
-        "merge_output_format": "mp4",
-    })
+def _run_ffprobe_json(path: str) -> Dict[str, Any]:
+    # Fallback leggero se meta_mod non esiste
     try:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info:
-                _raise_422("Download fallito.")
-            fn = ydl.prepare_filename(info)
-            if not os.path.exists(fn):
-                cand = None
-                for root, _, files in os.walk(tmpdir):
-                    for f in files:
-                        if f.endswith((".mp4",".mov",".mkv",".webm",".m4v",".avi")):
-                            cand = os.path.join(root, f); break
-                    if cand: break
-                fn = cand
-            if not fn or not os.path.exists(fn):
-                _raise_422("Download riuscito ma file non trovato.")
-            return fn, (info.get("url") or url)
+        cmd = [
+            "ffprobe", "-v", "error", "-print_format", "json",
+            "-show_format", "-show_streams", path
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=30)
+        return json.loads(out.decode("utf-8", errors="ignore"))
     except Exception as e:
-        msg = str(e).lower()
-        if any(x in msg for x in ["login", "private", "cookies", "not available", "rate", "protected"]):
-            _raise_422("Protected content o login richiesto. Suggerimento: usa 'Carica file' o 'Registra 10s'.")
-        _raise_422(f"Impossibile scaricare: {e}")
+        return {"error": str(e)}
 
-def _analyze_path(path: str, source_url: Optional[str]=None, resolved_url: Optional[str]=None) -> dict:
-    meta = extract_metadata(path)
-    if source_url is not None: meta["source_url"] = source_url
-    if resolved_url is not None: meta["resolved_url"] = resolved_url
+def _has_av_streams(ffmeta: Dict[str, Any]) -> bool:
+    try:
+        for s in ffmeta.get("streams", []):
+            if s.get("codec_type") in ("video", "audio"):
+                return True
+    except Exception:
+        pass
+    return False
 
-    c2pa = detect_c2pa(path)
-    dev_fp = detect_device_fingerprint(meta)
+def _download_via_httpx(url: str, dst_path: str, limit_bytes: int = RESOLVER_MAX_BYTES) -> Dict[str, Any]:
+    import httpx
+    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    with httpx.stream("GET", url, headers=headers, timeout=REQUEST_TIMEOUT_S, follow_redirects=True) as r:
+        ct = r.headers.get("content-type", "")
+        if "text/html" in ct.lower():
+            return {"ok": False, "error": "HTML page (login/protected or not a media)", "content_type": ct}
+        if "application/vnd.apple.mpegurl" in ct.lower() or "application/x-mpegURL" in ct.lower() or "mpegurl" in ct.lower():
+            return {"ok": False, "error": "HLS stream not supported", "content_type": ct}
 
-    v_res = analyze_video(path)
-    a_res = analyze_audio(path)
+        total = 0
+        with open(dst_path, "wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit_bytes:
+                    return {"ok": False, "error": "Resolver max bytes exceeded", "bytes": total, "limit": limit_bytes}
+                f.write(chunk)
+    return {"ok": True, "bytes": total, "content_type": ct}
 
-    hints = build_hints(meta, v_res.get("flags_video"), c2pa_present=c2pa.get("present", False), dev_fp=dev_fp)
-    fusion_core = fuse_scores(
-        frame=v_res["scores"].get("frame_mean", 0.5),
-        audio=a_res["scores"].get("audio_mean", 0.5),
-        hints=hints
-    )
+def _download_via_ytdlp(url: str, dst_dir: str) -> Dict[str, Any]:
+    # Scarica migliore variante avc + aac in file singolo se possibile (no cookie)
+    # Restituisce path file scaricato o errore
+    import yt_dlp
+    ydl_opts = {
+        "outtmpl": os.path.join(dst_dir, "dl.%(ext)s"),
+        "format": "mp4/bestaudio+bestvideo/best",
+        "noplaylist": True,
+        "quiet": True,
+        "nocheckcertificate": True,
+        "retries": 2,
+        "http_headers": {"User-Agent": USER_AGENT},
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            fn = ydl.prepare_filename(info)
+            # yt-dlp può dare estensioni diverse, normalizziamo se possibile
+            if os.path.exists(fn):
+                return {"ok": True, "path": fn}
+            # fallback: cerca file creati
+            for name in os.listdir(dst_dir):
+                if name.startswith("dl.") and os.path.isfile(os.path.join(dst_dir, name)):
+                    return {"ok": True, "path": os.path.join(dst_dir, name)}
+            return {"ok": False, "error": "File non trovato dopo download"}
+    except Exception as e:
+        return {"ok": False, "error": f"DownloadError yt-dlp: {e}"}
 
-    timeline = (v_res.get("timeline") or []) + (a_res.get("timeline") or [])
-    duration = meta.get("duration") or 0.0
-    base_bins = _bin_timeline(timeline, duration=duration or 0.0, bin_sec=1.0, mode="max")
-    fusion, peaks = finalize_with_timeline(fusion_core, base_bins)
+def _analyze_file(path: str, source_url: Optional[str] = None) -> Dict[str, Any]:
+    # 1) Meta
+    if meta_mod and hasattr(meta_mod, "get_media_meta"):
+        meta = meta_mod.get_media_meta(path, source_url=source_url)
+        ff = meta.get("ffprobe", {})
+    else:
+        ff = _run_ffprobe_json(path)
+        meta = {"ffprobe": ff}
 
-    tips = []
-    if fusion["label"] == "uncertain": tips.append("tip_uncertain")
-    if hints.get("no_c2pa"): tips.append("tip_no_c2pa")
-    if "long_pauses" in (a_res.get("flags_audio") or []): tips.append("tip_audio_pauses")
+    if not _has_av_streams(ff):
+        _bad_request("Unsupported or empty media: no audio/video streams found",
+                     {"ffprobe_found": True, "file_size": os.path.getsize(path)})
+
+    # 2) Video
+    video_stats = None
+    if video_mod and hasattr(video_mod, "analyze"):
+        try:
+            video_stats = video_mod.analyze(path, max_seconds=30.0, fps=2.5)
+        except Exception as e:
+            video_stats = {"error": f"video_analyze_error: {e}"}
+
+    # 3) Audio
+    audio_stats = None
+    if audio_mod and hasattr(audio_mod, "analyze"):
+        try:
+            audio_stats = audio_mod.analyze(path, target_sr=16000)
+        except Exception as e:
+            audio_stats = {"error": f"audio_analyze_error: {e}"}
+
+    # 4) Hints / Heuristics v2
+    hints = {}
+    if heur_v2 and hasattr(heur_v2, "compute_hints"):
+        try:
+            hints = heur_v2.compute_hints(meta=meta, video_stats=video_stats, audio_stats=audio_stats)
+        except Exception as e:
+            hints = {"error": f"hints_error: {e}"}
+
+    # 5) Fusione
+    if fusion_mod and hasattr(fusion_mod, "fuse"):
+        try:
+            fused = fusion_mod.fuse(video_stats=video_stats, audio_stats=audio_stats, hints=hints, meta=meta)
+        except Exception as e:
+            fused = {"result": {"label": "uncertain", "ai_score": 0.5, "confidence": 0.4, "reason": f"fusion_error: {e}"}}
+    else:
+        fused = {"result": {"label": "uncertain", "ai_score": 0.5, "confidence": 0.4, "reason": "fusion_missing"}}
 
     out = {
         "ok": True,
-        "meta": meta,
-        "forensic": {
-            "c2pa": {"present": c2pa.get("present", False)},
-            "device": dev_fp,
-        },
-        "result": {
-            "label": fusion["label"],
-            "ai_score": float(fusion["ai_score"]),
-            "confidence": float(fusion["confidence"]),
-            "reasons": fusion.get("reasons") or [],
-            "timeline": base_bins,
-            "peaks": peaks,
-            "tips": tips,
-        },
-        "analysis_mode": "heuristic",
-        "detector_version": DETECTOR_VERSION,
+        "meta": meta.get("summary", meta.get("format", {})) or {},
+        "forensic": meta.get("forensic", {}),
+        "video": video_stats or {},
+        "audio": audio_stats or {},
+        "hints": hints or {},
+        **fused
     }
     return out
 
-@app.get("/")
-def root():
-    return {"ok": True, "service": "ai-video", "author": __author__}
+# === Routes ===
 
 @app.get("/healthz")
 def healthz():
-    ffprobe_ok = bool(shutil.which("ffprobe"))
-    exiftool_ok = bool(shutil.which("exiftool"))
-    ok = ffprobe_ok and exiftool_ok
-    return JSONResponse({"ok": ok, "ffprobe": ffprobe_ok, "exiftool": exiftool_ok,
-                         "version": DETECTOR_VERSION, "author": __author__}, status_code=200 if ok else 500)
+    return PlainTextResponse("ok")
 
-# <<< NEW: catch-all OPTIONS per evitare 405 in preflight >>>
-@app.options("/{rest_of_path:path}")
-def any_options(rest_of_path: str):
-    # 204 No Content — CORS headers verranno aggiunti dal CORSMiddleware
-    return Response(status_code=204)
-
-# <<< NEW: endpoint diagnostico per CORS >>>
-@app.post("/cors-test")
-async def cors_test(request: Request):
-    hdrs = {k: v for k, v in request.headers.items()}
-    return JSONResponse({
-        "ok": True,
-        "seen_origin": hdrs.get("origin"),
-        "seen_access_control_request_method": hdrs.get("access-control-request-method"),
-        "seen_access_control_request_headers": hdrs.get("access-control-request-headers"),
-        "i_will_reply_to": ["GET","POST","OPTIONS"],
-        "allowed_by_env": {
-            "ALLOWED_ORIGINS": ALLOWED_ORIGINS,
-            "ALLOWED_ORIGIN_REGEX": ALLOWED_ORIGIN_REGEX or None
-        }
-    })
-
-# Upload a chunk + i18n error messages
 @app.post("/analyze")
-async def analyze(request: Request, file: UploadFile = File(...)):
-    lang = _negotiate_lang(request)
-    if not file:
-        _raise_422(_t(lang, "err_provide_file"))
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename or "upload")[1] or ".mp4")
-    size = 0
-    sha = hashlib.sha256()
+async def analyze(file: UploadFile = File(...)):
+    if not isinstance(file, (UploadFile, StarletteUploadFile)):
+        _bad_request("Nessun file ricevuto")
+    path = _save_upload_to_temp(file)
     try:
-        while True:
-            chunk = await file.read(1024 * 1024)  # 1 MB
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > MAX_UPLOAD_BYTES:
-                tmp.close()
-                try: os.remove(tmp.name)
-                except: pass
-                _raise_422(_t(lang, "err_too_big", limit_mb=int(MAX_UPLOAD_BYTES/1024/1024)))
-            sha.update(chunk)
-            tmp.write(chunk)
-        tmp.flush(); tmp.close()
-
-        key = "bytes:" + sha.hexdigest()
-        cached = _disk_cached(key)
-        if cached:
-            if isinstance(cached, dict) and "result" in cached and "tips" in cached["result"]:
-                cached_local = json.loads(json.dumps(cached))
-                cached_local["i18n_lang"] = lang
-                if isinstance(cached_local["result"].get("tips"), list):
-                    cached_local["result"]["tips"] = [
-                        _t(lang, t) if t in (_I18N.get(lang) or {}) else t
-                    for t in cached_local["result"]["tips"]
-                ]
-                return JSONResponse(cached_local)
-            return JSONResponse(cached)
-
-        out = _analyze_path(tmp.name)
-        if isinstance(out.get("result", {}).get("tips"), list):
-            out["i18n_lang"] = lang
-            out["result"]["tips"] = [
-                _t(lang, t) if t in (_I18N.get(lang) or {}) else t
-            for t in out["result"]["tips"]
-        ]
-        _disk_store(key, out, expire=3600)
-        return JSONResponse(out)
+        res = _analyze_file(path, source_url=None)
+        return JSONResponse(res)
     finally:
-        try: os.remove(tmp.name)
-        except: pass
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
+@app.post("/analyze-url")
+async def analyze_url(url: str = Form(...)):
+    if not url or not re.match(r"^https?://", url):
+        _bad_request("URL non valido")
+
+    tmpdir = tempfile.mkdtemp(prefix="aivdl_")
+    path = os.path.join(tmpdir, "media.bin")
+    used = "none"
+
+    try:
+        if USE_YTDLP:
+            ytd = _download_via_ytdlp(url, tmpdir)
+            if ytd.get("ok"):
+                path = ytd["path"]
+                used = "yt-dlp"
+            else:
+                # fallback httpx
+                dl = _download_via_httpx(url, path, RESOLVER_MAX_BYTES)
+                if not dl.get("ok"):
+                    _unprocessable(dl.get("error", "Impossibile scaricare il media"),
+                                   {"hint": "Se è protetto/login-wall, usa Carica file o Registra 10s"})
+                used = "httpx"
+        else:
+            dl = _download_via_httpx(url, path, RESOLVER_MAX_BYTES)
+            if not dl.get("ok"):
+                _unprocessable(dl.get("error", "Impossibile scaricare il media"),
+                               {"hint": "Se è protetto/login-wall, usa Carica file o Registra 10s"})
+            used = "httpx"
+
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            _unprocessable("Download completato ma file mancante o vuoto",
+                           {"resolver": used})
+
+        res = _analyze_file(path, source_url=url)
+        # Aggiungi info resolver
+        res.setdefault("tips", {})
+        res["tips"]["resolver"] = used
+        return JSONResponse(res)
+
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
 @app.post("/analyze-link")
-async def analyze_link(request: Request):
-    lang = _negotiate_lang(request)
-    url_in: Optional[str] = None
-    try:
-        data = await request.json()
-        if isinstance(data, dict): url_in = (data.get("url") or "").strip()
-    except: pass
-    if not url_in:
-        try:
-            form = await request.form()
-            if "url" in form: url_in = str(form.get("url") or "").strip()
-        except: pass
-    if not url_in:
-        url_in = (request.query_params.get("url") or "").strip()
-    if not url_in:
-        _raise_422(_t(lang, "err_provide_url"))
-
-    parsed = urlparse(url_in)
-    meta = {"source_url": url_in, "hostname": parsed.hostname, "path": parsed.path, "query": parsed.query}
-    out = {
+async def analyze_link(link: str = Form(...)):
+    # Endpoint "contestuale": non scarica; restituisce placeholder guida
+    return JSONResponse({
         "ok": True,
-        "meta": meta,
-        "forensic": {"c2pa": {"present": False}},
+        "meta": {},
+        "forensic": {},
         "result": {
             "label": "uncertain",
             "ai_score": 0.5,
-            "confidence": 0.5,
-            "reasons": ["context_only"],
-            "tips": [_t(lang, "err_use_analyze_url")],
+            "confidence": 0.4,
+            "reason": "Solo analisi del contesto/link: fornisci il video o usa /analyze-url per il download."
         },
-        "analysis_mode": "heuristic",
-        "detector_version": DETECTOR_VERSION,
-        "i18n_lang": lang
-    }
-    return JSONResponse(out)
+        "tips": {
+            "guide": "Per link protetti (Instagram privati, storie, ecc.), usa 'Carica file' o 'Registra 10s e carica'."
+        }
+    })
 
 @app.post("/predict")
-async def predict(request: Request, file: UploadFile = File(None), url: Optional[str] = Form(None)):
-    lang = _negotiate_lang(request)
-    if file is not None:
-        return await analyze(request, file=file)
+async def predict(
+    file: UploadFile = File(None),
+    url: Optional[str] = Form(None),
+):
+    # Retro-compatibilità: se c'è file → /analyze; se c'è url → /analyze-url
+    if file:
+        return await analyze(file=file)
     if url:
-        _raise_422(_t(lang, "err_use_analyze_url"))
-    _raise_422(_t(lang, "err_provide_file"))
+        return await analyze_url(url=url)
+    _bad_request("Nessun file o URL fornito")
