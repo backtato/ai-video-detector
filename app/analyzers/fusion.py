@@ -1,214 +1,176 @@
-# app/analyzers/fusion.py
 from typing import Dict, Any, List, Tuple
 import math
 
-# Soglie UI-friendly (pro-real)
 THRESH_REAL = 0.35
-THRESH_AI   = 0.75
+THRESH_AI   = 0.72
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, float(x)))
 
-def _get(d: Dict[str, Any], path: List[str], default=None):
+def _safe_get(d: Dict[str, Any], path: List[str], default=None):
     cur = d
     for p in path:
         if not isinstance(cur, dict) or p not in cur:
             return default
         cur = cur[p]
-    return cur if cur is not None else default
+    return cur
 
-def _label(s: float) -> str:
-    if s <= THRESH_REAL: return "real"
-    if s >= THRESH_AI:   return "ai"
-    return "uncertain"
+def _bpp(meta: Dict[str, Any], vstats: Dict[str, Any]) -> float:
+    br  = float(_safe_get(meta, ["bit_rate"], 0.0) or 0.0)
+    w   = float(_safe_get(vstats, ["width"], 0.0) or 0.0)
+    h   = float(_safe_get(vstats, ["height"], 0.0) or 0.0)
+    fps = float(_safe_get(vstats, ["src_fps"], _safe_get(meta, ["fps"], 0.0)) or 0.0)
+    denom = max(w*h*fps, 1.0)
+    return br/denom
 
-def _compression_from_meta(meta: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
-    """
-    bpp = bit_rate / (w*h*fps)
-    heavy  < 0.04
-    medium 0.04–0.12
-    light  > 0.12
-    """
-    notes: Dict[str, Any] = {}
-    w   = float(_get(meta, ["meta","width"],  _get(meta, ["width"], 0)) or 0)
-    h   = float(_get(meta, ["meta","height"], _get(meta, ["height"], 0)) or 0)
-    fps = float(_get(meta, ["meta","fps"],    _get(meta, ["fps"], 0)) or 0)
-    br  = float(_get(meta, ["meta","bit_rate"], _get(meta, ["bit_rate"], 0)) or 0)
-    px  = w*h
-    if px <= 0 or fps <= 0 or br <= 0:
-        notes.update({"compression":"unknown","bpp":None,"w":int(w),"h":int(h),"fps":fps,"br":int(br)})
-        return 0.50, notes
-    bpp = br / (px*fps)
-    notes.update({"bpp": round(bpp,5), "w": int(w), "h": int(h), "fps": fps, "br": int(br)})
-    if bpp < 0.04:
-        notes["compression"] = "heavy";  idx = 0.85
-    elif bpp < 0.12:
-        notes["compression"] = "medium"; idx = 0.55
+def _compression_from_bpp(bpp: float) -> Tuple[str, float]:
+    # Soglie tarate su iPhone H.264/HEVC consumer
+    if bpp < 0.03:
+        return ("heavy", 0.85)
+    if bpp < 0.08:
+        return ("medium", 0.55)
+    return ("low", 0.20)
+
+def _natural_capture_gate(vsum: Dict[str, float]) -> bool:
+    motion = float(vsum.get("motion_avg", 0.0))
+    flow   = float(vsum.get("optflow_mag_avg", 0.0))
+    dup    = float(vsum.get("dup_avg", 1.0))
+    return (motion > 12.0) and (flow > 1.0) and (dup < 0.80)
+
+def _video_base_score(vstats: Dict[str, Any]) -> float:
+    # Se esiste una timeline_ai calcolata dal video analyzer, usiamone la media (0..1)
+    tl_ai = vstats.get("timeline_ai")
+    if isinstance(tl_ai, list) and tl_ai:
+        vals = [float(x.get("ai_score", 0.5)) for x in tl_ai if isinstance(x, dict)]
+        if vals:
+            return float(sum(vals)/len(vals))
+    # fallback molto conservativo da summary (meno preciso)
+    s = vstats.get("summary", {}) or {}
+    # Più motion/flow => più reale ⇒ score AI più basso
+    motion = float(s.get("motion_avg", 0.0))
+    flow   = float(s.get("optflow_mag_avg", 0.0))
+    dup    = float(s.get("dup_avg", 0.0))
+    base = 0.5 + 0.15*(0.5 - min(motion/25.0, 1.0)) + 0.10*(0.5 - min(flow/3.0, 1.0)) + 0.10*max(min(dup-0.5, 0.5), -0.5)
+    return _clamp(base, 0.0, 1.0)
+
+def _audio_base_score(astats: Dict[str, Any]) -> float:
+    tl = astats.get("timeline") or []
+    if tl:
+        vals = [float(x.get("ai_score", 0.5)) for x in tl if isinstance(x, dict)]
+        if vals:
+            return float(sum(vals)/len(vals))
+    return float(astats.get("scores", {}).get("audio_mean", 0.5))
+
+def fuse(vstats: Dict[str, Any], astats: Dict[str, Any], m: Dict[str, Any]) -> Dict[str, Any]:
+    meta   = m.get("meta") or {}
+    forensic = m.get("forensic") or {}
+    c2pa = bool(_safe_get(forensic, ["c2pa","present"], False))
+
+    v_base = _video_base_score(vstats)
+    a_base = _audio_base_score(astats)
+
+    # Pesi bilanciati
+    w_v, w_a, w_h = 0.45, 0.45, 0.10
+
+    # Hints “soft”: NIENTE boost pro-AI. Solo piccoli pull verso 0.5 e impatto su confidenza.
+    # Calcolo bpp e livello compressione
+    bpp_val = _bpp(meta, vstats)
+    comp_label, comp_idx = _compression_from_bpp(bpp_val)
+
+    # Nota: il “pull” agisce SEMPRE verso 0.5, non verso 1.0
+    pull = 0.0
+    conf_pen = 0.0
+    if comp_label == "heavy":
+        pull += 0.12   # spinge verso incerto (riduce estremi)
+        conf_pen += 0.20
+    elif comp_label == "medium":
+        pull += 0.06
+        conf_pen += 0.10
+
+    # Natural-capture safety gate
+    if _natural_capture_gate(vstats.get("summary", {})):
+        # cap dell’AI se non c’è un modello forte a dire il contrario
+        v_cap = 0.70
     else:
-        notes["compression"] = "light";  idx = 0.15
-    return float(idx), notes
+        v_cap = 1.00
 
-def _align_bins(n: int, arr: List[float]) -> List[float]:
-    if n <= 0: return []
-    if not arr: return [0.5]*n
-    if len(arr) == n: return [float(x) for x in arr]
-    if len(arr) > n:  return [float(x) for x in arr[:n]]
-    out = [0.5]*n
-    out[:len(arr)] = [float(x) for x in arr]
-    return out
+    # Audio reliability gating: se mostly_silent/very_low_energy → riduci il peso audio
+    flags_audio = astats.get("flags_audio") or []
+    if ("mostly_silent" in flags_audio) or ("very_low_energy" in flags_audio):
+        w_a *= 0.65  # meno impatto dall’audio
 
-def _video_score_from_metrics(v: Dict[str, Any], n_bins: int) -> List[float]:
-    """
-    'video ai_score' sintetico da dup/blockiness/banding/motion
-    (placeholder ragionevole finché non c'è un modello video ML)
-    """
-    tl = _get(v, ["timeline"], []) or []
-    if not tl or not isinstance(tl, list):
-        return [0.5]*n_bins
-    scores = []
-    for i in range(min(n_bins, len(tl))):
-        sec = tl[i] or {}
-        dup  = float(sec.get("dup", 0.0))
-        blk  = float(sec.get("blockiness", 0.0))
-        band = float(sec.get("banding", 0.0))   # ~0.45 baseline
-        mot  = float(sec.get("motion", 0.0))
-        blk_n  = max(0.0, min(1.0, blk*8.0))            # 0..~0.2 ⇒ 0..1
-        band_n = max(0.0, min(1.0, (band-0.45)*10.0))   # baseline 0.45
-        mot_n  = max(0.0, min(1.0, mot/40.0))           # 40 = “molto movimento”
-        v_ai = 0.25*dup + 0.25*blk_n + 0.20*band_n + 0.30*(1.0 - mot_n)
-        scores.append(_clamp(v_ai))
-    return _align_bins(n_bins, scores)
+    # Combinazione di base
+    base_ai = (w_v * min(v_base, v_cap)) + (w_a * a_base) + (w_h * 0.5)  # hints neutri (0.5)
+    # Applica il pull verso 0.5
+    base_ai = 0.5 + (base_ai - 0.5) * (1.0 - pull)
+    base_ai = _clamp(base_ai, 0.0, 1.0)
 
-def fuse(video_stats: Dict[str, Any], audio_stats: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
-    v = video_stats or {}
-    a = audio_stats or {}
-    m = meta or {}
+    # Effetto C2PA: solo direzione pro-reale + penalità confidenza
+    if c2pa:
+        base_ai = 0.5 + (base_ai - 0.5) * 0.85  # tira verso 0.5
+        conf_pen += 0.05
 
-    duration = float(_get(m, ["meta","duration"], _get(v, ["duration"], 0.0)) or 0.0)
-    n_bins   = max(int(math.ceil(duration)), 1)
+    # Timeline binned (qui neutra: tutto al valore finale) + peaks piatti
+    # (compatibilità con UI: puoi in futuro popolarla con combinazioni per-secondo)
+    timeline_binned = []
+    peaks = []
+    # Manteniamo 1 valore per secondo per la durata stimata video, se disponibile
+    duration = int(round(float(_safe_get(vstats, ["duration"], 0.0) or 0.0)))
+    duration = max(1, min(duration, 180))
+    for t in range(duration):
+        timeline_binned.append({"start": t, "end": t+1, "ai_score": float(base_ai)})
+        peaks.append({"t": t, "ai_score": float(base_ai)})
 
-    # timeline audio
-    a_tl = _get(a, ["timeline"], []) or []
-    a_bins = _align_bins(n_bins, [float(x.get("ai_score", 0.5)) for x in a_tl] if a_tl else [])
-
-    # timeline video (preferisci timeline_ai se già calcolata)
-    v_ai_tl = _get(v, ["timeline_ai"], [])
-    if v_ai_tl and isinstance(v_ai_tl, list) and all(isinstance(x, dict) and "ai_score" in x for x in v_ai_tl):
-        v_bins = _align_bins(n_bins, [float(x["ai_score"]) for x in v_ai_tl])
+    # Label + confidenza
+    ai_score = float(base_ai)
+    if ai_score >= THRESH_AI:
+        label = "ai"
+    elif ai_score <= THRESH_REAL:
+        label = "real"
     else:
-        v_bins = _video_score_from_metrics(v, n_bins)
+        label = "uncertain"
 
-    video_has_signal = any(abs(x-0.5) > 0.03 for x in v_bins)
+    # Confidenza: spread ridotta + penalità compressione
+    conf = 0.70  # base conservativa
+    if label == "ai":
+        conf += 0.10
+    elif label == "real":
+        conf += 0.08
+    conf = max(0.10, conf - conf_pen)
+    confidence = int(round(_clamp(conf, 0.10, 0.99) * 100))
 
-    # indici globali
-    comp_idx, comp_notes = _compression_from_meta(m)
-    flow        = float(_get(v, ["summary","optflow_mag_avg"], 0.0) or 0.0)
-    motion_avg  = float(_get(v, ["summary","motion_avg"],      0.0) or 0.0)
-    dup_avg     = float(_get(v, ["summary","dup_avg"],         0.0) or 0.0)
-
-    # audio “naturale”?
-    tts_like  = float(_get(a, ["scores","tts_like"],  0.5))
-    hnr_proxy = float(_get(a, ["scores","hnr_proxy"], 0.6))
-    audio_looks_natural = (hnr_proxy >= 0.60 and tts_like <= 0.45)
-
-    # pesi base (riduciamo il boost audio)
-    w_audio_base, w_video = 0.50, 0.45
-    if audio_looks_natural:
-        w_audio = 0.38; w_video = 0.54   # se audio “umano”, diamo più fiducia al video
-    else:
-        w_audio = w_audio_base
-    w_boost = 0.07  # prima 0.10: abbassato
-    total_w = w_audio + w_video + w_boost
-    w_audio /= total_w; w_video /= total_w; w_boost /= total_w
-
-    natural_motion = (flow >= 0.30) or (motion_avg >= 5.0)
-    not_heavy      = comp_idx <= 0.60
-
-    fused: List[float] = []
-    conflict_bins = 0
-
-    for i in range(n_bins):
-        a_i = a_bins[i] if i < len(a_bins) else 0.5
-        v_i = v_bins[i] if i < len(v_bins) else 0.5
-
-        # attenuazione “per-bin” del segnale audio quando il video contraddice (<0.55)
-        # e la scena è naturale e non heavy: l’audio non deve sovrastare il video.
-        if natural_motion and not_heavy and v_i < 0.55 and a_i > 0.65:
-            conflict_bins += 1
-            # attenuazione proporzionale a quanto il video è basso (max -40%)
-            atten = min(0.40, (0.55 - v_i) * 0.8)  # v_i=0.35 -> atten≈0.16
-            a_i = 0.5 + (a_i - 0.5) * (1.0 - atten)
-
-        base = (w_audio * a_i) + (w_video * v_i) + (w_boost * (a_i - 0.5) + 0.5)
-        base = _clamp(base)
-
-        # pull da compressione
-        pull = 0.05 + 0.05 * (1.0 if comp_idx >= 0.75 else (0.5 if comp_idx >= 0.5 else 0.0))
-        base = 0.5 + (base - 0.5) * (1.0 - pull)
-
-        # CAP quando il video è neutro (nessun segnale) ma moto naturale:
-        if natural_motion and not_heavy and (not video_has_signal) and a_i >= 0.65:
-            base = min(base, 0.80)
-
-        fused.append(_clamp(base))
-
-    # Gating “globale” se molti bin sono in conflitto (audio alto vs video basso)
-    conflict_ratio = conflict_bins / float(max(1, n_bins))
-    if natural_motion and not_heavy and conflict_ratio >= 0.25:
-        # abbassa la media (pro-real) e limita i picchi oltre 0.85
-        fused = [min(x, 0.85) for x in fused]
-        # lieve spinta additiva verso 0.5
-        fused = [0.5 + (x-0.5)*0.92 for x in fused]  # 8% in meno di deviazione
-
-    ai_score = float(sum(fused)/len(fused)) if fused else 0.5
-    label    = _label(ai_score)
-
-    # confidenza: dipende dalla “deviazione” + qualità audio + minor compressione
-    dev  = sum(abs(x-0.5) for x in fused)/max(len(fused),1)
-    conf = 0.10 + 0.70*min(dev*2.0, 1.0) + 0.10*max(0.0, (abs(tts_like-0.5)*2.0 - 0.2)) + 0.10*(1.0 - comp_idx)
-    confidence = int(round(_clamp(conf, 0.10, 0.99)*100))
-
-    # timeline & peaks
-    timeline_binned = [{"start": i, "end": i+1, "ai_score": float(fused[i])} for i in range(len(fused))]
-    peaks = [{"t": i, "ai_score": float(fused[i])} for i in range(len(fused)) if fused[i] <= 0.30 or fused[i] >= 0.70]
-
-    # reason string
+    # Reason string (umano-friendly)
     reasons: List[str] = []
-    if comp_idx >= 0.75:
-        reasons.append("Compressione pesante (WhatsApp/ri-upload)")
-    elif comp_idx >= 0.50:
-        reasons.append("Compressione moderata")
-    if dup_avg >= 0.90:
-        reasons.append("Molti frame quasi identici (scena statica)")
-    if flow <= 0.10 and motion_avg <= 5.0:
-        reasons.append("Movimento scarso/innaturale")
+    if comp_label in ("medium","heavy"):
+        reasons.append(f"Compressione {comp_label}")
+    if _natural_capture_gate(vstats.get("summary", {})):
+        reasons.append("Dinamica da ripresa reale (safety-cap applicato)")
+    if c2pa:
+        reasons.append("C2PA/Manifest presente")
 
-    # Reason per conflitto audio-vs-video
-    # (si attiva quando abbiamo effettivamente attenuato o fatto gating)
-    if natural_motion and not_heavy and (conflict_ratio >= 0.20):
-        reasons.append("Audio dominante senza supporto del video")
+    result = {
+        "label": label,
+        "ai_score": float(round(ai_score, 6)),
+        "confidence": int(confidence),
+        "reason": "; ".join(reasons) if reasons else "",
+    }
 
-    # C2PA (path corretto)
-    c2pa_present = bool(_get(m, ["forensic","c2pa","present"], False))
-    hints = dict(comp_notes)
-    if c2pa_present:
-        hints["c2pa_present"] = True
-
-    hints["flow_used"] = round(flow,4)
-    hints["motion_used"] = round(motion_avg,4)
-    hints["video_has_signal"] = bool(video_has_signal)
-    hints["audio_video_conflict_ratio"] = round(conflict_ratio, 3)
-
-    if not reasons:
-        reasons.append("Segnali misti o neutri")
+    hints = {
+        "bpp": float(round(bpp_val, 5)),
+        "compression": comp_label,
+        "video_has_signal": True if vstats else False,
+        "flow_used": float(round(float(_safe_get(vstats, ["summary","optflow_mag_avg"], 0.0) or 0.0), 4)),
+        "motion_used": float(round(float(_safe_get(vstats, ["summary","motion_avg"], 0.0) or 0.0), 3)),
+    }
+    if c2pa:
+        hints["c2pa_present"] = "Manifest/Content Credentials rilevati"
+    hints["w"] = int(_safe_get(vstats, ["width"], 0) or _safe_get(meta, ["width"], 0) or 0)
+    hints["h"] = int(_safe_get(vstats, ["height"], 0) or _safe_get(meta, ["height"], 0) or 0)
+    hints["fps"] = float(_safe_get(meta, ["fps"], 0.0) or 0.0)
+    hints["br"]  = int(_safe_get(meta, ["bit_rate"], 0) or 0)
 
     return {
-        "result": {
-            "label": label,
-            "ai_score": float(round(ai_score, 6)),
-            "confidence": int(confidence),
-            "reason": "; ".join(reasons),
-        },
+        "result": result,
         "timeline_binned": timeline_binned,
         "peaks": peaks,
         "hints": hints,
