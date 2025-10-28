@@ -28,14 +28,15 @@ def _norm(x: np.ndarray) -> np.ndarray:
         return np.zeros_like(x, dtype=float)
     return (x - mn) / ptp
 
-def analyze(path: str) -> Dict[str, Any]:
+def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
     """
     Output:
       "scores": {"audio_mean": float, "tts_like": float, "hnr_proxy": float},
       "flags_audio": [str, ...],
       "timeline": [{"start":s, "end":e, "ai_score":float}, ...]
+    NOTE: `target_sr` è accettato (compatibile con api.py) e passato all’estrazione WAV.
     """
-    wav = _extract_wav(path, sr=16000)
+    wav = _extract_wav(path, sr=target_sr)
     try:
         y, sr = sf.read(wav)  # già mono
         flags: List[str] = []
