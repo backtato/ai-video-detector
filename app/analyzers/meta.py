@@ -1,126 +1,103 @@
 # app/analyzers/meta.py
-import json
-import subprocess
-from typing import Dict, Any, Optional
+# Rilevamento "device" e presenza C2PA dai metadati. Zero dipendenze interne.
 
-def _run(cmd: list) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True)
+from __future__ import annotations
+import subprocess
+import json
+from typing import Dict, Any, Optional, List, Tuple
+
+def _run(cmd: List[str]) -> Tuple[int, str, str]:
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except Exception as e:
+        return 1, "", str(e)
 
 def _ffprobe_json(path: str) -> Dict[str, Any]:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-print_format", "json",
-        "-show_format", "-show_streams", "-show_chapters",
-        path
-    ]
-    p = _run(cmd)
+    code, out, _ = _run([
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_format", "-show_streams", path
+    ])
+    if code != 0:
+        return {}
     try:
-        return json.loads(p.stdout or "{}")
+        return json.loads(out or "{}")
     except Exception:
         return {}
 
-def _exiftool_json(path: str) -> Dict[str, Any]:
-    p = _run(["exiftool", "-j", "-n", path])
+def _exiftool_json(path: str) -> List[Dict[str, Any]]:
+    code, out, _ = _run(["exiftool", "-j", "-struct", "-G", "-n", path])
+    if code != 0:
+        return []
     try:
-        data = json.loads(p.stdout or "[]")
-        if isinstance(data, list) and data:
-            return data[0]
+        data = json.loads(out or "[]")
+        return data if isinstance(data, list) else []
     except Exception:
-        pass
-    return {}
+        return []
 
-def extract_metadata(path: str) -> Dict[str, Any]:
+def detect_device(path: str) -> Dict[str, Any]:
     """
-    Estrae metadati 'ricchi' (ffprobe + exiftool se presente).
+    Ritorna: {"device": {"vendor": str|None, "model": str|None, "os": "iOS|Android|Unknown"}}
+    Heuristics:
+      - tag QuickTime: com.apple.quicktime.make/model => iOS
+      - 'handler_name'/'encoder' contenenti iPhone/iPad/Apple => iOS
+      - indizi Android (sm-, samsung, xiaomi, pixel, oneplus) => Android (debole)
     """
-    info = _ffprobe_json(path)
-    fmt = info.get("format", {}) or {}
-    streams = info.get("streams", []) or []
-    v = next((s for s in streams if s.get("codec_type") == "video"), {})
-    a = next((s for s in streams if s.get("codec_type") == "audio"), {})
+    ffj = _ffprobe_json(path)
+    vendor = None
+    model  = None
+    os_name = "Unknown"
 
-    def _as_int(x): 
-        try: return int(x)
-        except: return None
+    fmt_tags = (ffj.get("format", {}) or {}).get("tags", {}) or {}
+    streams  = ffj.get("streams", []) or []
+    vtags = next((s.get("tags", {}) for s in streams if s.get("codec_type") == "video"), {})
+    atags = next((s.get("tags", {}) for s in streams if s.get("codec_type") == "audio"), {})
+    pool = [fmt_tags, vtags or {}, atags or {}]
 
-    def _as_float(x):
-        try: return float(x)
-        except: return None
+    def _get(*names: str) -> Optional[str]:
+        for d in pool:
+            for n in names:
+                if n in d and d[n]:
+                    return str(d[n])
+        return None
 
-    width  = _as_int(v.get("width"))
-    height = _as_int(v.get("height"))
-    duration = _as_float(fmt.get("duration"))
-    bit_rate = _as_int(fmt.get("bit_rate"))
+    apple_make  = _get("com.apple.quicktime.make", "Make")
+    apple_model = _get("com.apple.quicktime.model", "Model")
+    handler     = _get("handler_name", "handler", "major_brand") or ""
+    encoder     = _get("encoder", "com.apple.quicktime.software") or ""
+    blob = (handler + " " + encoder).lower()
 
-    # FPS robusto
-    fps = None
-    for k in ("avg_frame_rate","r_frame_rate"):
-        r = v.get(k)
-        if r and isinstance(r,str) and "/" in r and r != "0/0":
-            try:
-                n,d = r.split("/")
-                n,d = float(n), float(d)
-                if d!=0: fps = n/d; break
-            except: pass
-    if not fps:
-        nb = v.get("nb_frames")
-        if nb and duration:
-            try: fps = float(nb)/float(duration)
-            except: fps = None
+    if apple_make or apple_model:
+        vendor = apple_make or "Apple"
+        model  = apple_model
+        os_name = "iOS"
+    elif any(k in blob for k in ["iphone", "ipad", "apple"]):
+        vendor = "Apple"
+        model  = "iPhone/iPad?"
+        os_name = "iOS"
+    elif any(k in blob for k in ["android", "sm-", "samsung", "xiaomi", "oneplus", "redmi", "pixel"]):
+        vendor = "Android?"
+        model  = None
+        os_name = "Android"
 
-    tags = {}
-    tags.update(fmt.get("tags") or {})
-    tags.update(v.get("tags") or {})
-    tags.update(a.get("tags") or {})
-
-    exif = _exiftool_json(path)
-    if exif:
-        for k in ["Make","Model","Software","CreateDate","ModifyDate","GPSLatitude","GPSLongitude","Duration"]:
-            if k in exif and exif[k] is not None:
-                tags.setdefault(k, exif[k])
-
-    meta = {
-        "width": width,
-        "height": height,
-        "fps": fps,
-        "duration": duration,
-        "bit_rate": bit_rate,
-        "vcodec": v.get("codec_name") or None,
-        "acodec": a.get("codec_name") or None,
-        "format_name": fmt.get("format_name") or None,
-        "make": tags.get("Make") or tags.get("com.apple.quicktime.make") or tags.get("com.android.manufacturer"),
-        "model": tags.get("Model") or tags.get("com.apple.quicktime.model") or tags.get("com.android.model"),
-        "software": tags.get("Software") or tags.get("encoder") or tags.get("com.apple.quicktime.software"),
-        "creation_time": tags.get("creation_time") or tags.get("CreateDate") or tags.get("com.apple.quicktime.creationdate"),
-        "orientation": tags.get("Orientation") or tags.get("rotate") or v.get("tags", {}).get("rotate"),
-        "gps": {"lat": tags.get("GPSLatitude"), "lon": tags.get("GPSLongitude")},
-        "raw_tags": tags,
-        "ffprobe_raw": info,  # utile per debug forense
-    }
-    return meta
-
-def detect_device_fingerprint(meta: Dict[str, Any]) -> Dict[str, Any]:
-    tags = (meta or {}).get("raw_tags") or {}
-    apple_qt = any(
-        str(k).lower().startswith("com.apple.quicktime") or ("apple" in str(v).lower())
-        for k,v in tags.items()
-    )
-    model = str(meta.get("model") or "")
-    make  = str(meta.get("make") or "")
-    sw    = str(meta.get("software") or "")
-
-    return {
-        "apple_quicktime_tags": bool(apple_qt),
-        "iphone_like": model.lower().startswith(("iphone","ipad","ipod")),
-        "android_like": any(b in make.lower() for b in ["samsung","xiaomi","google","oneplus","huawei","oppo"]),
-        "editor_like": any(x in sw.lower() for x in ["premiere","after effects","capcut","resolve","davinci","ffmpeg"]),
-    }
+    return {"device": {"vendor": vendor, "model": model, "os": os_name}}
 
 def detect_c2pa(path: str) -> Dict[str, Any]:
+    """
+    Ritorna: {"present": bool, "note": str}
+    Heuristica veloce: cerca parole chiave C2PA/JUMBF/Content Credentials negli XMP (exiftool).
+    Se exiftool non è presente → present=False con nota.
+    """
+    probe = _exiftool_json(path)
     present = False
-    # exiftool scan
-    p = _run(["exiftool","-j", path])
-    raw = (p.stdout or "") + (p.stderr or "")
-    if any(s in raw.lower() for s in ["c2pa","content credentials","adobe signature"]):
-        present = True
-    return {"present": bool(present)}
+    note = ""
+
+    if probe:
+        text = json.dumps(probe, ensure_ascii=False).lower()
+        if any(k in text for k in ['"c2pa"', "content credentials", "jumbf", "manifest"]):
+            present = True
+            note = "Possibile C2PA/JUMBF nei metadati XMP"
+    else:
+        note = "ExifTool non disponibile o nessun XMP letto"
+
+    return {"present": present, "note": note}
