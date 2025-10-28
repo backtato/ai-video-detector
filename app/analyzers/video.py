@@ -24,49 +24,52 @@ def analyze(path: str, max_seconds: float = 30.0, fps: float = 2.5) -> dict:
     - Feature per frame: y_mean, edge_var (Laplacian var), motion MAD, dup-hash,
       blockiness, banding.
     - Optical flow Farnebäck (magnitudo media tra frame consecutivi).
-    - Timeline binned per secondo + summary.
+    - Timeline binned per secondo con medie robuste.
     """
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        return {"error": "opencv_open_failed"}
+        return {"timeline": [], "summary": {}}
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
     src_fps = float(cap.get(cv2.CAP_PROP_FPS)) or 0.0
-    duration = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) / src_fps) if src_fps > 0 else 0.0
+    src_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    src_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
-    # Sampling adattivo
-    step = max(int(round(src_fps / fps)) if src_fps > 0 else int(round(30 / fps)), 1)
+    # campiona a min(fps, src_fps/6) per ridurre dup falsi su video molto statici
+    target_fps = min(fps, max(1.0, src_fps / 6.0)) if src_fps > 0 else fps
+    step = max(1, int(round(max(src_fps / target_fps, 1.0)))) if src_fps > 0 else int(round(30.0 / fps))
 
     frames_info = []
-    total_frames = 0
-    grabbed = -1
     prev_gray = None
-    prev_hash = None
     flow_mag_means = []
+    prev_hash = None
+    total_frames = 0
 
+    # Lettura frame
+    idx = 0
     while True:
-        grabbed += 1
         ok = cap.grab()
         if not ok:
             break
-        if grabbed % step != 0:
+        idx += 1
+        if idx % step != 0:
             continue
+
         ok, frame = cap.retrieve()
         if not ok or frame is None:
-            break
+            continue
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        y_mean = float(gray.mean())
-        lap = cv2.Laplacian(gray, cv2.CV_64F)
-        edge_var = float(lap.var())
 
-        # Motion MAD
+        # Edge var (Laplacian)
+        edge_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        y_mean   = float(np.mean(gray))
+
+        # Motion MAD (proxy)
         motion = 0.0
         if prev_gray is not None:
-            motion = float(np.mean(np.abs(gray.astype(np.float32) - prev_gray.astype(np.float32))))
-
-        # Optical flow Farnebäck
+            diff = cv2.absdiff(gray, prev_gray)
+            motion = float(np.mean(diff))
+        # Optical flow
         if prev_gray is not None:
             flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
                                                 0.5, 3, 15, 3, 5, 1.2, 0)
@@ -80,19 +83,20 @@ def analyze(path: str, max_seconds: float = 30.0, fps: float = 2.5) -> dict:
         if prev_hash is not None:
             # similarità: 1.0 = identico
             dup = 1.0 - float(np.mean(np.bitwise_xor(ph, prev_hash)))
+            # Sgonfia dup se c'è motion reale recente
+            if len(flow_mag_means) >= 3:
+                recent_flow = float(np.mean(flow_mag_means[-3:]))
+                if recent_flow > 0.2:
+                    dup = max(0.0, dup - 0.15)
         else:
             dup = 0.0
         prev_hash = ph
 
-        # Compression artifacts
+        # Blockiness & banding
         blockiness = _blockiness_score(gray)
-        banding = _banding_score(gray)
-
-        # Timestamp
-        ts = (grabbed / (src_fps if src_fps > 0 else fps)) if src_fps > 0 else (len(frames_info) / fps)
+        banding    = _banding_score(gray)
 
         frames_info.append({
-            "t": ts,
             "y_mean": y_mean,
             "edge_var": edge_var,
             "motion": motion,
@@ -108,35 +112,52 @@ def analyze(path: str, max_seconds: float = 30.0, fps: float = 2.5) -> dict:
     cap.release()
 
     if not frames_info:
-        return {"error": "no_frames"}
+        return {"timeline": [], "summary": {}}
 
-    # Timeline per secondo
-    last_t = frames_info[-1]["t"]
-    n_bins = max(int(last_t) + 1, 1)
-    timeline = []
-    for sec in range(n_bins):
-        seg = [x for x in frames_info if sec <= x["t"] < sec + 1]
-        if not seg:
-            continue
-        y_mean = float(np.mean([x["y_mean"] for x in seg]))
-        edge_var = float(np.mean([x["edge_var"] for x in seg]))
-        motion = float(np.mean([x["motion"] for x in seg]))
-        dup = float(np.mean([x["dup"] for x in seg]))
-        blockiness = float(np.mean([x["blockiness"] for x in seg]))
-        banding = float(np.mean([x["banding"] for x in seg]))
-        timeline.append({
-            "start": float(sec), "end": float(sec + 1),
+    # Binning per secondo con medie
+    # Stima seconds da numero frames campionati e target_fps
+    seconds = int(np.ceil(float(total_frames) / max(target_fps, 1.0)))
+    seconds = max(1, min(seconds, 180))
+
+    # segmenta frames_info in blocchi ~ per secondo
+    per_sec = []
+    stride = max(1, int(round(total_frames / seconds)))
+    for s in range(seconds):
+        start = s * stride
+        end   = min(total_frames, (s + 1) * stride)
+        if start >= end:
+            break
+        seg = frames_info[start:end]
+        # medie robuste
+        y_mean      = float(np.mean([x["y_mean"] for x in seg]))
+        edge_var    = float(np.mean([x["edge_var"] for x in seg]))
+        motion      = float(np.mean([x["motion"] for x in seg]))
+        dup         = float(np.mean([x["dup"] for x in seg]))
+        blockiness  = float(np.mean([x["blockiness"] for x in seg]))
+        banding     = float(np.mean([x["banding"] for x in seg]))
+
+        per_sec.append({
             "y_mean": y_mean, "edge_var": edge_var, "motion": motion,
             "dup": dup, "blockiness": blockiness, "banding": banding
         })
 
-    def arr(key):
-        return np.array([x[key] for x in timeline], dtype=np.float32) if timeline else np.array([], np.float32)
+    # summary
+    timeline = []
+    def arr(key): return np.array([x[key] for x in per_sec], dtype=np.float32)
+
+    for i, row in enumerate(per_sec):
+        timeline.append({
+            "start": float(i),
+            "end": float(i + 1),
+            **row
+        })
 
     stats = {
-        "width": width, "height": height,
-        "src_fps": src_fps, "duration": duration,
-        "sampled_fps": fps,
+        "width": int(min(src_w, src_h)) if (src_w and src_h) else 0,
+        "height": int(max(src_w, src_h)) if (src_w and src_h) else 0,
+        "src_fps": float(src_fps),
+        "duration": float(seconds),
+        "sampled_fps": float(target_fps),
         "frames_sampled": int(total_frames),
         "timeline": timeline,
         "summary": {
@@ -150,4 +171,3 @@ def analyze(path: str, max_seconds: float = 30.0, fps: float = 2.5) -> dict:
         }
     }
     return stats
-
