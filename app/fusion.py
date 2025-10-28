@@ -1,135 +1,105 @@
-import math
+# app/fusion.py
+# Fusione adattiva video+audio+hints; soglie dinamiche per bitrate; confidenza leggibile;
+# reason codes più espliciti. Mantiene chiave 'result' e campi timeline_binned/peaks.
+
 import numpy as np
 
-THRESH_REAL = 0.38
-THRESH_AI = 0.72
-
-# pesi conservativi
+BASE_THRESH_REAL = 0.38
+BASE_THRESH_AI   = 0.72
 W_VIDEO = 0.55
 W_AUDIO = 0.35
 W_HINTS = 0.10
 
-def _score_from_video(vstats: dict) -> (float, list):
+def _score_from_video(vstats: dict):
     if not vstats or "timeline" not in vstats:
         return 0.5, []
-
     tl = vstats.get("timeline", [])
-    if not tl:
-        return 0.5, []
+    motion = np.array([x.get("motion", 0.0) for x in tl], dtype=np.float32)
+    edge   = np.array([x.get("edge_var", 0.0) for x in tl], dtype=np.float32)
+    dup    = np.array([x.get("dup", 0.0) for x in tl], dtype=np.float32)
+    block  = np.array([x.get("blockiness", 0.0) for x in tl], dtype=np.float32)
+    band   = np.array([x.get("banding", 0.0) for x in tl], dtype=np.float32)
 
-    # Heuristica: più motion/edge ⇒ meno “sintetico”
-    m = np.array([x.get("motion", 0.0) for x in tl], dtype=np.float32)
-    e = np.array([x.get("edge_var", 0.0) for x in tl], dtype=np.float32)
-
-    # Normalizzazioni robuste
-    def robust_norm(x):
-        if x.size == 0:
-            return x
-        xm = float(x.mean())
-        xs = float(x.std()) or 1.0
-        z = (x - xm) / xs
-        # mappa z in [0,1]
-        return 1.0 / (1.0 + np.exp(-z))
-
-    m_n = robust_norm(m)  # 0..1
-    e_n = robust_norm(e)  # 0..1
-
-    # Se entrambe basse (~0) ⇒ potenziale “sintetico/schermo”, score AI ↑
-    # Invertiamo il segno: 1 - max(m,e) => più basso dinamismo ⇒ score AI maggiore
-    per_sec_ai = (1.0 - np.maximum(m_n, e_n)).clip(0.0, 1.0)
-    score = float(per_sec_ai.mean()) if per_sec_ai.size else 0.5
-    return score, per_sec_ai.tolist()
-
-def _score_from_audio(astats: dict) -> (float, list):
-    if not astats or "timeline" not in astats:
-        return 0.5, []
-    tl = astats["timeline"]
-    # Semplice proxy: più silenzi/piattezza ⇒ più “sintetico”
-    rms = np.array([x.get("rms", 0.0) for x in tl], dtype=np.float32)
-    zcr = np.array([x.get("zcr", 0.0) for x in tl], dtype=np.float32)
-
-    # Normalizza robustamente
     def rn(x):
-        if x.size == 0:
-            return x
-        xm = float(x.mean())
-        xs = float(x.std()) or 1.0
+        if x.size == 0: return x
+        xm, xs = float(x.mean()), float(x.std() or 1.0)
         z = (x - xm) / xs
         return 1.0 / (1.0 + np.exp(-z))
 
-    rms_n = rn(rms)
-    zcr_n = rn(zcr)
+    # Heuristica: più dup/block/band → più probabile sintetico/schermo
+    v_ai = np.clip(0.25*(1.0 - rn(motion)) +
+                   0.25*(1.0 - rn(edge)) +
+                   0.25*rn(dup) +
+                   0.25*(rn(block) + rn(band))/2.0, 0.0, 1.0)
+    score = float(v_ai.mean()) if v_ai.size else 0.5
+    return score, v_ai.tolist()
 
-    # Se entrambe basse ⇒ score AI ↑
-    per_sec_ai = (1.0 - np.maximum(rms_n, zcr_n)).clip(0.0, 1.0)
-    score = float(per_sec_ai.mean()) if per_sec_ai.size else 0.5
-    return score, per_sec_ai.tolist()
+def _score_from_audio(astats: dict):
+    if not astats: return 0.5, []
+    tts_like = float(astats.get("scores", {}).get("tts_like", 0.0))
+    audio_mean = float(astats.get("scores", {}).get("audio_mean", 0.5))
+    score = float(0.6*audio_mean + 0.4*tts_like)
+    timeline = astats.get("timeline", [])
+    return score, [float(x.get("ai_score", score)) for x in timeline]
 
-def _score_from_hints(hints: dict) -> float:
-    if not hints:
-        return 0.5
-    # media pesata semplice: flag negativi spingono verso AI (↑)
-    # normalizziamo in [0,1]
-    vals = []
-    for k, v in hints.items():
-        if isinstance(v, dict) and "score" in v:
-            vals.append(float(v.get("score", 0.5)))
-    if not vals:
-        return 0.5
-    return float(np.mean(vals))
+def _score_from_hints(hints: dict):
+    if not hints: return 0.5
+    vals = [float(v.get("score", 0.5)) for v in hints.values() if isinstance(v, dict)]
+    return float(np.mean(vals)) if vals else 0.5
 
-def _bin_by_second(per_sec_seq: list, duration: float) -> list:
-    # per_sec_seq è già per-second in molti casi; qui lo allineiamo
-    if not per_sec_seq:
+def _bin_by_second(seq, duration):
+    if not isinstance(seq, (list, tuple)) or not seq:
         return []
-    # taglia alla durata
-    max_len = max(1, int(duration))
-    arr = per_sec_seq[:max_len]
-    return [{"t": i, "ai": float(arr[i])} for i in range(len(arr))]
+    n = min(int(duration) if duration else len(seq), len(seq))
+    out = []
+    for i in range(n):
+        out.append({"start": float(i), "end": float(i+1), "ai_score": float(seq[i])})
+    return out
 
-def _find_peaks(bins: list, min_prom: float = 0.15) -> list:
-    if not bins:
-        return []
-    arr = np.array([b["ai"] for b in bins], dtype=np.float32)
-    peaks = []
-    if arr.size < 3:
-        return peaks
-    mean = float(arr.mean())
-    std = float(arr.std()) or 1.0
-    for i in range(1, arr.size - 1):
-        if arr[i] > arr[i-1] and arr[i] > arr[i+1]:
-            if (arr[i] - mean) > min_prom * std:
-                peaks.append({"t": int(bins[i]["t"]), "ai": float(arr[i])})
-    return peaks
-
-def fuse(video_stats: dict, audio_stats: dict, hints: dict, meta: dict) -> dict:
+def fuse(video_stats=None, audio_stats=None, hints=None, meta=None):
+    hints = hints or {}
+    meta = meta or {}
     duration = 0.0
     try:
-        if video_stats and video_stats.get("duration"):
-            duration = float(video_stats["duration"])
-        elif meta and "summary" in meta and meta["summary"].get("duration"):
-            duration = float(meta["summary"]["duration"])
+        duration = float(video_stats.get("duration", 0.0))
     except Exception:
-        duration = 0.0
+        pass
 
     v_score, v_seq = _score_from_video(video_stats)
     a_score, a_seq = _score_from_audio(audio_stats)
     h_score = _score_from_hints(hints)
 
-    # Fusione conservativa
-    ai_score = float(W_VIDEO * v_score + W_AUDIO * a_score + W_HINTS * h_score)
-    ai_score = max(0.0, min(1.0, ai_score))
+    # Pesi adattivi se audio manca
+    wv, wa, wh = W_VIDEO, W_AUDIO, W_HINTS
+    if not audio_stats or not a_seq:
+        wa = 0.0
+        total = wv + wh
+        if total > 0:
+            wv, wh = wv/total, wh/total
+
+    ai_score = float(np.clip(wv * v_score + wa * a_score + wh * h_score, 0.0, 1.0))
+
+    # Soglie dinamiche per bitrate basso (WhatsApp/schermo)
+    bit_rate = float(meta.get("bit_rate", 0.0) or meta.get("summary", {}).get("bit_rate", 0.0) or 0.0)
+    t_real, t_ai = BASE_THRESH_REAL, BASE_THRESH_AI
+    if bit_rate and bit_rate < 800_000:
+        t_real = 0.34
+        t_ai   = 0.76
 
     # Label
-    if ai_score >= THRESH_AI:
+    if ai_score >= t_ai:
         label = "ai"
-    elif ai_score <= THRESH_REAL:
+    elif ai_score <= t_real:
         label = "real"
     else:
         label = "uncertain"
 
-    # Timeline binned
-    # Se abbiamo entrambe, facciamo media; altrimenti quella disponibile
+    # Confidenza (0..1) → UI la può mappare a percentuale
+    dist = max(ai_score - t_ai, t_real - ai_score, 0.0)
+    span = max(t_ai - t_real, 1e-6)
+    confidence = float(np.clip(0.5 + (dist / span), 0.0, 1.0))
+
+    # Timeline binned (merge semplice video/audio)
     max_len = int(max(len(v_seq), len(a_seq)))
     per_sec = []
     for i in range(max_len):
@@ -137,47 +107,31 @@ def fuse(video_stats: dict, audio_stats: dict, hints: dict, meta: dict) -> dict:
         as_ = a_seq[i] if i < len(a_seq) else None
         if vs is None and as_ is None:
             continue
-        if vs is None:
-            per_sec.append(as_)
-        elif as_ is None:
-            per_sec.append(vs)
-        else:
-            per_sec.append((vs + as_) / 2.0)
+        if vs is None: per_sec.append(as_)
+        elif as_ is None: per_sec.append(vs)
+        else: per_sec.append(float(0.6*vs + 0.4*as_))
+    timeline_binned = _bin_by_second(per_sec, duration)
 
-    timeline_binned = _bin_by_second(per_sec, duration or len(per_sec))
-    peaks = _find_peaks(timeline_binned)
+    # Peaks
+    peaks = [{"t": float(i), "ai_score": float(s)} for i, s in enumerate(per_sec) if s is not None and s >= 0.85][:10]
 
-    # Confidence = 1 - std (più stabile → più conf)
-    if per_sec:
-        std = float(np.std(np.array(per_sec, dtype=np.float32)))
-        confidence = float(max(0.0, min(1.0, 1.0 - std)))
-    else:
-        confidence = 0.5
-
-    # Reason sintetico
+    # Reason codes
     reasons = []
-    if label == "ai":
-        reasons.append("Pattern di bassa dinamica/texture compatibili con contenuto sintetico o schermata.")
-    elif label == "real":
-        reasons.append("Dinamica e texture più coerenti con cattura reale.")
-    else:
-        reasons.append("Segnali contrastanti o insufficienti; analisi conservativa.")
+    neg = [k for k, v in (hints or {}).items() if isinstance(v, dict) and v.get("score", 0.5) >= 0.6][:5]
+    pos = [k for k, v in (hints or {}).items() if isinstance(v, dict) and v.get("score", 0.5) <= 0.45][:5]
+    if neg: reasons.append("Hints−: " + ", ".join(neg))
+    if pos: reasons.append("Hints+: " + ", ".join(pos))
+    if bit_rate and bit_rate < 800_000: reasons.append("Bitrate molto basso → soglie conservative.")
+    if not a_seq: reasons.append("Audio assente o non utilizzabile.")
+    if label == "uncertain": reasons.append("Segnali misti o qualità/compressione limitante.")
 
-    # Aggiungi hint principali
-    if hints:
-        neg = [k for k, v in hints.items() if isinstance(v, dict) and v.get("score", 0.5) > 0.6]
-        if neg:
-            reasons.append("Hints: " + ", ".join(neg))
-
-    result = {
+    return {
         "result": {
             "label": label,
             "ai_score": ai_score,
             "confidence": confidence,
-            "reason": " ".join(reasons)
+            "reason": " ".join(reasons).strip()
         },
         "timeline_binned": timeline_binned,
         "peaks": peaks
     }
-    return result
-
