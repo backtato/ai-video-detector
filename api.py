@@ -170,6 +170,21 @@ def _compute_bpp(meta: dict, br_bits_per_s: int) -> float:
     # bits per pixel per frame ~ bitrate / (fps * pixels_per_frame)
     return float(br_bits_per_s) / (fps * (w * h))
 
+def _clamp_timeline(timeline: List[Dict[str, Any]], duration_s: float) -> List[Dict[str, Any]]:
+    """Clamp generico di una timeline [start,end) alla durata indicata."""
+    if not timeline or duration_s <= 0:
+        return timeline or []
+    out: List[Dict[str, Any]] = []
+    for b in timeline:
+        s = float(b.get("start", 0))
+        e = float(b.get("end", s + 1))
+        if s >= duration_s:
+            break
+        bb = dict(b)
+        bb["end"] = min(e, duration_s)
+        out.append(bb)
+    return out
+
 # ==== HEALTH ====
 @app.get("/healthz")
 async def healthz():
@@ -194,9 +209,7 @@ async def analyze(file: UploadFile = File(...)):
         if not file or not file.filename:
             return _fail(415, "File vuoto o non ricevuto")
 
-        mime = file.content_type or mimetypes.guess_type(file.filename)[0] or ""
-        # non blocchiamo "octet-stream": browser spesso usano quello
-
+        # salvataggio su disco con limite dimensione
         tmpd = _tmpdir("up_")
         path = os.path.join(tmpd, file.filename.replace("/", "_"))
         size = 0
@@ -274,7 +287,7 @@ async def preflight(path: str):
 
 # ==== Core analysis ====
 def _analyze_file(path: str, source_url: Optional[str] = None) -> JSONResponse:
-    # forense leggera + device + c2pa
+    # forense + device + c2pa (tollerante agli errori)
     try:
         forensic = forensic_an.analyze(path)
     except Exception:
@@ -300,6 +313,14 @@ def _analyze_file(path: str, source_url: Optional[str] = None) -> JSONResponse:
     except Exception:
         astats = {}
 
+    # ⬅️ Clamp finale timeline audio alla durata video (evita bucket 16→16.36 ecc.)
+    try:
+        vdur = float(vstats.get("duration") or 0.0)
+        if vdur > 0 and astats.get("timeline"):
+            astats["timeline"] = _clamp_timeline(astats["timeline"], vdur)
+    except Exception:
+        pass
+
     # meta essenziali per UI
     try:
         meta = {
@@ -319,7 +340,7 @@ def _analyze_file(path: str, source_url: Optional[str] = None) -> JSONResponse:
     except Exception:
         meta = {"source_url": source_url, "resolved_url": source_url}
 
-    # ==== Hints (bpp/compressione, signal) ====
+    # ==== Hints (bpp/compressione, signal) + backfill bitrate in meta ====
     try:
         file_size_bytes = os.path.getsize(path)
     except Exception:
@@ -334,7 +355,10 @@ def _analyze_file(path: str, source_url: Optional[str] = None) -> JSONResponse:
     elif bpp < 0.10:
         compression = "moderate"
 
-    # segnali video riassunti (se disponibili)
+    # backfill in meta se mancava
+    if int(meta.get("bit_rate") or 0) <= 0 and bitrate > 0:
+        meta["bit_rate"] = bitrate
+
     vsummary = vstats.get("summary") or {}
     motion_used = float(vsummary.get("motion_avg") or 0.0)
     flow_used = float(vsummary.get("optflow_mag_avg") or 0.0)
@@ -377,7 +401,6 @@ def _analyze_file(path: str, source_url: Optional[str] = None) -> JSONResponse:
         "peaks": peaks,
     }
 
-    # UI-friendly clamp (fallbacks)
     payload["result"]["label"] = payload["result"].get("label") or _label_from_score(payload["result"].get("ai_score", 0.5))
     payload["result"]["confidence"] = _confidence_from_payload(payload)
 
