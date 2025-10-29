@@ -1,10 +1,8 @@
 import os
 from typing import Dict, Any, List, Tuple
 
-REAL_TH = 0.40   # soglia più "real-friendly"
+REAL_TH = 0.35   # allineato alla UI conservativa
 AI_TH   = 0.72
-
-# Soglia configurabile per picchi (stabilizza "peaks" su compressioni alte)
 MIN_PEAK_SCORE = float(os.getenv("MIN_PEAK_SCORE", "0.12"))
 
 def _clamp(v, lo, hi):
