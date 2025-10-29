@@ -1,148 +1,116 @@
-import os
-import tempfile
-import subprocess
-from typing import Dict, Any, List
-
 import numpy as np
-import soundfile as sf
-import librosa
 
-def _run(cmd: list) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True)
+# Nota: questo modulo assume che l’estrazione WAV 16k mono sia già gestita in api.py
+# Features: RMS, spectral flatness, ZCR, rolloff; VAD leggero; cap in assenza di voce
+# Flags opzionali: likely_music, low_voice_presence
 
-def _extract_wav(path: str, sr: int = 16000) -> str:
-    tmp = tempfile.mkdtemp(prefix="aud_")
-    out = os.path.join(tmp, "audio.wav")
-    cmd = [
-        "ffmpeg", "-y", "-i", path,
-        "-ac", "1", "-ar", str(sr),
-        "-map_metadata", "-1", "-vn", "-sn", "-dn", out
-    ]
-    _run(cmd)
-    return out
+def _clamp(v, lo, hi): 
+    return max(lo, min(hi, v))
 
-def _norm(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=float)
-    if x.size == 0:
-        return x
-    mn = float(np.min(x)); ptp = float(np.ptp(x))
-    if ptp == 0.0:
-        return np.zeros_like(x)
-    return (x - mn) / ptp
+def _mean(xs): 
+    return float(sum(xs) / max(1, len(xs)))
 
-def _clamp_timeline_to_duration(timeline: List[Dict[str, Any]], duration_s: float) -> List[Dict[str, Any]]:
-    """Evita bucket oltre la durata e taglia l’ultimo end alla durata esatta."""
-    if duration_s <= 0:
-        return []
-    out: List[Dict[str, Any]] = []
-    for b in timeline:
-        s = float(b.get("start", 0))
-        e = float(b.get("end", s + 1))
-        if s >= duration_s:
-            break
-        bb = dict(b)
-        bb["end"] = min(e, duration_s)
-        out.append(bb)
-    return out
+def _voice_presence(rms_win):
+    # VAD molto semplice: quanta frazione di finestre supera una soglia di energia
+    if not rms_win:
+        return 0.0
+    thr = np.percentile(rms_win, 60)  # adattivo
+    active = sum(1 for r in rms_win if r >= thr)
+    return active / len(rms_win)
 
-def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
+def analyze(wav_16k_mono: np.ndarray, sr: int, duration_sec: float) -> dict:
     """
-    Timeline per-secondo con features semplici + VAD leggero.
-    In assenza di voce, limita l'impatto dei pattern "tts-like".
+    Restituisce:
+      scores{ audio_mean, tts_like, hnr_proxy }, flags_audio[], timeline[{start,end,ai_score}]
+    con cap per musica/silenzio/voce scarsa per evitare picchi falsi.
     """
-    wav = _extract_wav(path, sr=target_sr)
-    flags: List[str] = []
-    try:
-        y, sr = sf.read(wav, always_2d=False)
-        if y is None:
-            return {"scores": {"audio_mean": 0.5, "tts_like": 0.0, "hnr_proxy": 0.0},
-                    "flags_audio": ["no_audio"], "timeline": []}
-        if isinstance(y, np.ndarray) and y.ndim > 1:
-            y = np.mean(y, axis=1)
-        y = np.asarray(y, dtype=np.float32)
-
-        duration = float(len(y)) / float(sr) if sr > 0 else 0.0
-        if duration <= 0.0:
-            return {"scores": {"audio_mean": 0.5, "tts_like": 0.0, "hnr_proxy": 0.0},
-                    "flags_audio": ["no_audio"], "timeline": []}
-
-        win = int(sr)      # 1s
-        hop = int(sr)
-        n_fft = win
-        win_len = win
-
-        rms  = librosa.feature.rms(y=y, frame_length=win, hop_length=hop, center=False)[0]
-        flat = librosa.feature.spectral_flatness(y=y, n_fft=n_fft, hop_length=hop, win_length=win_len, center=False)[0]
-        zcr  = librosa.feature.zero_crossing_rate(y, frame_length=win, hop_length=hop, center=False)[0]
-        roll = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=hop, roll_percent=0.85, n_fft=n_fft, center=False)[0]
-
-        L = int(min(rms.shape[0], flat.shape[0], zcr.shape[0], roll.shape[0]))
-        if L <= 0:
-            return {"scores": {"audio_mean": 0.5, "tts_like": 0.0, "hnr_proxy": 0.0},
-                    "flags_audio": ["no_audio"], "timeline": []}
-
-        rms, flat, zcr, roll = rms[:L], flat[:L], zcr[:L], roll[:L]
-
-        rms_n   = _norm(rms)
-        flat_n  = _norm(flat)
-        zcr_n   = _norm(zcr)
-        roll_n  = _norm(roll)
-
-        # VAD grezzo: voce se energia > mediana e rolloff non troppo alto
-        energy_med = float(np.median(rms))
-        vad = (rms > (energy_med * 1.15)) & (roll_n < 0.75)
-        vad_ratio = float(np.mean(vad)) if vad.size else 0.0
-
-        # HNR proxy: dinamica energia vs flatness
-        hnr_proxy = float(np.clip((np.std(rms_n) + (1.0 - np.mean(flat_n))) / 2.0, 0.0, 1.0))
-
-        # AI per-secondo (euristica conservativa)
-        ai_per_sec = (
-            0.35 * flat_n +
-            0.30 * (1.0 - rms_n) +
-            0.20 * (1.0 - np.clip(np.std(rms_n), 0.0, 1.0)) +
-            0.15 * (1.0 - np.clip(np.std(zcr_n), 0.0, 1.0))
-        ).astype(float)
-
-        # In assenza di voce, cap per evitare falsi positivi da rumore/NR
-        if vad_ratio < 0.25:
-            flags.append("low_voice_presence")
-            ai_per_sec = np.minimum(ai_per_sec, 0.60)
-
-        ai_per_sec = np.clip(ai_per_sec, 0.0, 1.0)
-
-        energy_mean   = float(np.mean(rms)) if rms.size else 0.0
-        silence_ratio = float(np.mean(rms < (energy_med * 0.3 + 1e-9))) if rms.size else 1.0
-        if silence_ratio > 0.7:
-            flags.append("mostly_silent")
-        if energy_mean < 1e-3:
-            flags.append("very_low_energy")
-
-        # Timeline per-secondo
-        n_bins = int(np.ceil(duration))
-        n_bins = max(1, min(n_bins, 180))
-        per_frames = ai_per_sec.tolist() or [0.5]
-        if len(per_frames) < n_bins:
-            per_frames += [per_frames[-1]] * (n_bins - len(per_frames))
-
-        timeline = [{"start": i, "end": i + 1, "ai_score": float(np.clip(per_frames[i], 0.0, 1.0))}
-                    for i in range(n_bins)]
-
-        # ⬅️ FIX: clamp alla durata reale
-        timeline = _clamp_timeline_to_duration(timeline, duration)
-
+    if wav_16k_mono is None or wav_16k_mono.size == 0 or sr <= 0:
         return {
-            "scores": {
-                "audio_mean": float(np.mean([b["ai_score"] for b in timeline])) if timeline else 0.5,
-                "tts_like": float(np.mean(flat_n)) if flat_n.size else 0.0,
-                "hnr_proxy": hnr_proxy,
-            },
-            "flags_audio": flags,
-            "timeline": timeline
+            "scores": {"audio_mean": 0.5, "tts_like": 0.5, "hnr_proxy": 0.5},
+            "flags_audio": ["low_voice_presence"],
+            "timeline": []
         }
-    finally:
-        try:
-            os.remove(wav)
-            os.rmdir(os.path.dirname(wav))
-        except Exception:
-            pass
+
+    # Finestre da 1s
+    win = sr
+    n = len(wav_16k_mono)
+    nwin = max(1, int(np.ceil(n / win)))
+    timeline = []
+    rms_list = []
+    zcr_list = []
+    roll_list = []
+    flat_list = []
+
+    for i in range(nwin):
+        s = i * win
+        e = min(n, (i + 1) * win)
+        seg = wav_16k_mono[s:e].astype(np.float32)
+        if seg.size == 0:
+            ai = 0.5
+            timeline.append({"start": i, "end": min(i + 1, duration_sec), "ai_score": ai})
+            continue
+
+        # RMS
+        rms = float(np.sqrt(np.mean(seg ** 2)))
+        rms_list.append(rms)
+
+        # Zero Crossing Rate
+        zc = np.mean(np.abs(np.diff(np.sign(seg)))) if seg.size > 1 else 0.0
+        zcr_list.append(float(zc))
+
+        # Rolloff (proxy molto semplice su FFT)
+        fft = np.abs(np.fft.rfft(seg, n=2048))
+        cumsum = np.cumsum(fft)
+        thr = 0.85 * cumsum[-1] if cumsum[-1] > 0 else 0
+        roll_idx = int(np.searchsorted(cumsum, thr))
+        rolloff = roll_idx / 1024.0
+        roll_list.append(float(rolloff))
+
+        # Spectral flatness proxy (varianza normalizzata)
+        if fft.size > 0:
+            flat = float(np.std(fft) / (np.mean(fft) + 1e-8))
+        else:
+            flat = 0.0
+        flat_list.append(flat)
+
+    vad = _voice_presence(rms_list)
+
+    flags = []
+    if vad < 0.25:
+        flags.append("low_voice_presence")
+
+    # very rough music heuristic
+    # musica/ambiente: rolloff alto e flatness medio-bassa (spettro "riempito") con ZCR moderata
+    likely_music = (_mean(roll_list) > 0.45 and _mean(flat_list) < 0.9 and _mean(zcr_list) < 0.25)
+    if likely_music:
+        flags.append("likely_music")
+
+    # scoring per-secondo (grezzo ma stabile)
+    timeline_scores = []
+    for i in range(nwin):
+        ai = 0.5
+        # trend: più "tonale/omogeneo" (flatness bassa) + poco parlato → salirebbe,
+        # ma applichiamo CAP per evitare picchi su musica/ambiente/silenzio
+        base = 0.48 + 0.1 * (0.5 - min(flat_list[i], 1.0)) + 0.05 * (roll_list[i] - 0.4)
+        ai = float(base)
+
+        # CAPS
+        if "low_voice_presence" in flags:
+            ai = min(ai, 0.60)
+        if likely_music:
+            ai = min(ai, 0.60)
+
+        ai = _clamp(ai, 0.35, 0.70)
+        timeline_scores.append(ai)
+        timeline.append({"start": i, "end": min(i + 1, duration_sec), "ai_score": ai})
+
+    out = {
+        "scores": {
+            "audio_mean": _mean(timeline_scores) if timeline_scores else 0.5,
+            "tts_like": _mean(flat_list) if flat_list else 0.5,
+            "hnr_proxy": 1.0 - (_mean(zcr_list) if zcr_list else 0.5)
+        },
+        "flags_audio": flags,
+        "timeline": timeline
+    }
+    return out
