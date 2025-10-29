@@ -5,8 +5,8 @@ workers = 1
 worker_class = "uvicorn.workers.UvicornWorker"
 
 # Allineati ai timeouts interni (yt-dlp 180s, ffmpeg 60s, ecc.)
-timeout = 240
-graceful_timeout = 30
+timeout = 300
+graceful_timeout = 60
 keepalive = 5
 
 # Riciclo periodico per evitare leak/latenze accumulate in librerie native
