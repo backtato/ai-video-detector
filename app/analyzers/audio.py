@@ -88,3 +88,5 @@ def analyze(wav_16k_mono: np.ndarray, sr: int, duration_sec: float) -> dict:
         "timeline": timeline
     }
     return out
+
+# Note: ensure timeline clamping is handled in api.py fusion stage.
