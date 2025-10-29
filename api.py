@@ -1,9 +1,8 @@
 import os
-import io
 import json
 import tempfile
 import subprocess
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,12 +19,11 @@ from app.analyzers import meta as meta_an
 from app.analyzers import fusion as fusion_an
 from app.analyzers import heuristics_v2 as heur_an
 
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))  # 50MB
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 REQUEST_TIMEOUT_S = int(os.getenv("REQUEST_TIMEOUT_S", "240"))
 
 app = FastAPI()
 
-# CORS universale ma configurabile
 allow_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -36,12 +34,7 @@ app.add_middleware(
 )
 
 def _run_ffprobe(path: str) -> Dict[str, Any]:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-print_format", "json",
-        "-show_streams", "-show_format",
-        path
-    ]
+    cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=30)
         return json.loads(out.decode("utf-8", errors="ignore"))
@@ -72,9 +65,19 @@ def _probe_basic(meta_json: Dict[str, Any]) -> Dict[str, Any]:
         pass
     return dict(width=w, height=h, fps=fps, duration=dur, bit_rate=br, vcodec=vcodec, acodec=acodec, format_name=fmt)
 
+def _try_cv_meta(path: str) -> Dict[str, Any]:
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return {}
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    dur = float(frame_count / fps) if fps > 0 else 0.0
+    cap.release()
+    return {"width": w, "height": h, "fps": fps, "duration": dur}
+
 def _extract_wav_16k(path: str):
-    # Estrazione robusta con ffmpeg → wav 16k mono in RAM
-    # In caso di errore restituisce None
     try:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         tmp.close()
@@ -101,46 +104,52 @@ def _compression_from_bpp(bpp: float) -> str:
         return "normal"
     return "low"
 
-def _try_cv_meta(path: str) -> Dict[str, Any]:
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        return {}
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    # durata approssimata
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    dur = float(frame_count / fps) if fps > 0 else 0.0
-    cap.release()
-    return {"width": w, "height": h, "fps": fps, "duration": dur}
-
 def _analyze_file(path: str) -> Dict[str, Any]:
     meta_json = _run_ffprobe(path)
     basic = _probe_basic(meta_json)
 
-    # Fallback OpenCV se meta video mancano
+    # fallback meta con OpenCV
     if basic["width"] == 0 or basic["height"] == 0 or basic["fps"] == 0:
         cvb = _try_cv_meta(path)
         for k in ("width", "height", "fps", "duration"):
-            if basic.get(k) in (None, 0) and cvb.get(k):
+            if (not basic.get(k)) and cvb.get(k):
                 basic[k] = cvb[k]
 
-    # Forensic/EXIF e device
-    forensic = forensic_an.analyze(path) if hasattr(forensic_an, "analyze") else {"c2pa": {"present": False}}
-    device = meta_an.detect_device(path) if hasattr(meta_an, "detect_device") else {"vendor": None, "model": None, "os": None}
-
-    # Audio
+    # AUDIO
     wav, sr = _extract_wav_16k(path)
-    audio = audio_an.analyze(wav, sr, basic["duration"]) if wav is not None else {"scores": {"audio_mean": 0.5}, "flags_audio": ["low_voice_presence"], "timeline": []}
+    duration_audio = float(len(wav) / sr) if (wav is not None and sr > 0) else 0.0
+    audio = audio_an.analyze(wav, sr, duration_audio) if wav is not None else {
+        "scores": {"audio_mean": 0.5}, "flags_audio": ["low_voice_presence"], "timeline": []
+    }
 
-    # Video
+    # durata robusta
+    if not basic["duration"] or basic["duration"] == 0:
+        if duration_audio > 0:
+            basic["duration"] = duration_audio
+
+    # backfill bit_rate da filesize/durata
+    try:
+        if (not basic["bit_rate"] or basic["bit_rate"] == 0) and basic["duration"] and basic["duration"] > 0:
+            fsize_bits = os.path.getsize(path) * 8.0
+            basic["bit_rate"] = int(fsize_bits / basic["duration"])
+    except Exception:
+        pass
+
+    # sanity-cap fps anomali
+    if basic["fps"] and basic["fps"] > 120.0:
+        basic["fps"] = 60.0
+
+    # VIDEO
     video_has_signal = bool(basic["width"] and basic["height"] and basic["fps"])
     if video_has_signal:
         video = video_an.analyze(path, basic["fps"], basic["duration"])
     else:
         video = {"timeline": [], "summary": {}}
+    # se l’analisi non produce timeline → trattalo come no video
+    if not video.get("timeline"):
+        video_has_signal = False
 
-    # Hints
+    # HINTS di base
     bpp = _calc_bpp(basic.get("bit_rate") or 0, basic.get("width") or 0, basic.get("height") or 0, basic.get("fps") or 0.0)
     hints = {
         "bpp": bpp,
@@ -152,8 +161,8 @@ def _analyze_file(path: str) -> Dict[str, Any]:
         "br": basic.get("bit_rate") or 0
     }
 
-    # Clamp durate timeline all’effettiva durata
-    dur = float(basic.get("duration") or len(audio.get("timeline", [])))
+    # clamp timeline a durata
+    dur = float(basic.get("duration") or duration_audio or 0.0)
     def _clamp_tl(tl):
         out = []
         for x in tl or []:
@@ -165,44 +174,37 @@ def _analyze_file(path: str) -> Dict[str, Any]:
             out.append({"start": s, "end": e, "ai_score": float(x.get("ai_score", 0.5))})
         return out
 
-    video_ai = video.get("timeline") or []
-    audio_tl = audio.get("timeline") or []
-
-    # ricava riassunti utili per fusion
     v_summary = video.get("summary") or {}
-    hints["flow_used"] = float(v_summary.get("optflow_mag_avg") or 0.0)
-    hints["motion_used"] = float(v_summary.get("motion_avg") or 0.0)
-
-    # Traspone timeline video nel formato atteso da fusion (timeline_ai)
     video_out = {
-        "timeline": _clamp_tl(video_ai),
+        "timeline": _clamp_tl(video.get("timeline") or []),
         "summary": v_summary,
-        "timeline_ai": [{"start": t["start"], "end": t["end"], "ai_score": t["ai_score"]} for t in _clamp_tl(video_ai)]
+        "timeline_ai": [{"start": t["start"], "end": t["end"], "ai_score": t["ai_score"]} for t in _clamp_tl(video.get("timeline") or [])]
     }
     audio_out = {
         "scores": audio.get("scores") or {},
         "flags_audio": audio.get("flags_audio") or [],
-        "timeline": _clamp_tl(audio_tl)
+        "timeline": _clamp_tl(audio.get("timeline") or [])
     }
 
     meta_out = {
         "width": basic["width"], "height": basic["height"], "fps": basic["fps"], "duration": basic["duration"],
         "bit_rate": basic["bit_rate"], "vcodec": basic["vcodec"], "acodec": basic["acodec"], "format_name": basic["format_name"],
         "source_url": None, "resolved_url": None,
-        "forensic": {"c2pa": {"present": bool((forensic or {}).get("c2pa", {}).get("present"))}},
-        "device": device
+        "forensic": {"c2pa": {"present": False}},
+        "device": meta_an.detect_device(path) if hasattr(meta_an, "detect_device") else {"vendor": None, "model": None, "os": None}
     }
 
-    # hints arricchiti
+    hints["flow_used"] = float(v_summary.get("optflow_mag_avg") or 0.0)
+    hints["motion_used"] = float(v_summary.get("motion_avg") or 0.0)
+
     hints = heur_an.build_hints(meta_out, video_out, audio_out, hints)
 
     fused = fusion_an.fuse(meta_out, hints, video_out, audio_out)
 
-    # Impacchetta l’output finale
     out = {
         "ok": True,
         "meta": meta_out,
-        "forensic": {"c2pa": {"present": bool((forensic or {}).get("c2pa", {}).get("present"))}},
+        "forensic": {"c2pa": {"present": meta_out.get("forensic", {}).get("c2pa", {}).get("present", False)}},
         "video": video_out,
         "audio": audio_out,
         "hints": hints,
@@ -222,26 +224,23 @@ async def analyze(file: UploadFile = File(...)):
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail={"error": "File troppo grande"})
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename or '')[-1]) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
     try:
-        out = _analyze_file(tmp_path)
+        with open(tmp.name, "wb") as f:
+            f.write(data)
+        out = _analyze_file(tmp.name)
         return JSONResponse(out)
     finally:
         try:
-            os.unlink(tmp_path)
+            os.unlink(tmp.name)
         except Exception:
             pass
 
 @app.post("/analyze-url")
 async def analyze_url(url: str = Form(None), link: str = Form(None), q: str = Form(None)):
-    # Qui lasci invariata la tua logica di resolver/yt-dlp; semplifico per focus
     u = url or link or q
     if not u:
         raise HTTPException(status_code=422, detail="URL mancante")
-    # Scarico temporaneo con yt-dlp (solo pubblico, niente cookies)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tmp.close()
     try:
@@ -269,6 +268,4 @@ async def predict(file: UploadFile = File(None), url: str = Form(None)):
 
 @app.get("/healthz")
 def healthz():
-    # Verifica di base per deploy
-    ffprobe_ok = bool(_run_ffprobe.__name__)
-    return JSONResponse({"ok": True, "ffprobe": True, "exiftool": True, "version": "1.2.1", "author": "Backtato"})
+    return JSONResponse({"ok": True, "ffprobe": True, "exiftool": True, "version": "1.2.2", "author": "Backtato"})
