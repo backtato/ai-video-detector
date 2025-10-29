@@ -8,25 +8,20 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-import numpy as np
-import soundfile as sf
-import cv2
-try:
-    cv2.setNumThreads(1)
-    cv2.ocl.setUseOpenCL(False)
-except Exception:
-    pass
-
+# Analyzer locali
 from app.analyzers import audio as audio_an
 from app.analyzers import video as video_an
-from app.analyzers import forensic as forensic_an
+from app.analyzers import forensic as forensic_an  # lasciato per compatibilità futura
 from app.analyzers import meta as meta_an
 from app.analyzers import fusion as fusion_an
 from app.analyzers import heuristics_v2 as heur_an
 
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+# ----- Config -----
+VERSION = os.getenv("SERVICE_VERSION", "1.2.2")
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 REQUEST_TIMEOUT_S = int(os.getenv("REQUEST_TIMEOUT_S", "240"))
 
+# ----- App & CORS -----
 app = FastAPI()
 
 allow_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -38,6 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----- Utils -----
 def _run_ffprobe(path: str) -> Dict[str, Any]:
     cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path]
     try:
@@ -47,7 +43,10 @@ def _run_ffprobe(path: str) -> Dict[str, Any]:
         return {}
 
 def _probe_basic(meta_json: Dict[str, Any]) -> Dict[str, Any]:
-    w = h = fps = dur = br = 0
+    w = h = 0
+    fps = 0.0
+    dur = 0.0
+    br = 0
     vcodec = acodec = fmt = None
     try:
         for st in meta_json.get("streams", []):
@@ -71,6 +70,14 @@ def _probe_basic(meta_json: Dict[str, Any]) -> Dict[str, Any]:
     return dict(width=w, height=h, fps=fps, duration=dur, bit_rate=br, vcodec=vcodec, acodec=acodec, format_name=fmt)
 
 def _try_cv_meta(path: str) -> Dict[str, Any]:
+    # Import lazy per evitare pesi in startup
+    import cv2
+    try:
+        cv2.setNumThreads(1)
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
+
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         return {}
@@ -83,6 +90,10 @@ def _try_cv_meta(path: str) -> Dict[str, Any]:
     return {"width": w, "height": h, "fps": fps, "duration": dur}
 
 def _extract_wav_16k(path: str):
+    # Import lazy
+    import soundfile as sf
+    import numpy as np
+
     try:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         tmp.close()
@@ -109,6 +120,7 @@ def _compression_from_bpp(bpp: float) -> str:
         return "normal"
     return "low"
 
+# ----- Core analyze -----
 def _analyze_file(path: str) -> Dict[str, Any]:
     meta_json = _run_ffprobe(path)
     basic = _probe_basic(meta_json)
@@ -190,7 +202,7 @@ def _analyze_file(path: str) -> Dict[str, Any]:
         "timeline": _clamp_tl(audio.get("timeline") or [])
     }
 
-    # DEVICE: unwrap se il detector ritorna {"device": {...}}
+    # DEVICE
     dev = meta_an.detect_device(path) if hasattr(meta_an, "detect_device") else {"vendor": None, "model": None, "os": None}
     if isinstance(dev, dict) and "device" in dev and isinstance(dev["device"], dict):
         dev = dev["device"]
@@ -222,6 +234,7 @@ def _analyze_file(path: str) -> Dict[str, Any]:
     }
     return out
 
+# ----- Endpoints -----
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     if not file:
@@ -232,7 +245,6 @@ async def analyze(file: UploadFile = File(...)):
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail={"error": "File troppo grande"})
 
-    # PATCH: usa estensione .mp4 per facilitare i demuxer
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     try:
         with open(tmp.name, "wb") as f:
@@ -275,53 +287,12 @@ async def predict(file: UploadFile = File(None), url: str = Form(None)):
         return await analyze_url(url=url)
     raise HTTPException(status_code=422, detail="Fornire file o url")
 
-# FACOLTATIVO: diagnostica CORS / preflight universale
-@app.get("/healthz")
-def healthz():
-    return JSONResponse({"ok": True, "ffprobe": True, "exiftool": True, "version": "1.2.2", "author": "Backtato"})
-
-# === Health/CORS minimal endpoints inserted ===
-
-@app.get("/", response_class=JSONResponse)
-def root():
-    return {"ok": True, "service": "ai-video-detector", "version": VERSION}
-
-
-from functools import lru_cache
-from time import perf_counter
-import shutil as _shutil
-
-@lru_cache(maxsize=1)
-def _ready_probe():
-    t0 = perf_counter()
-    ffprobe = _shutil.which("ffprobe") is not None
-    exiftool = _shutil.which("exiftool") is not None
-    return {"ffprobe_found": ffprobe, "exiftool_found": exiftool, "elapsed_ms": int((perf_counter()-t0)*1000)}
-
-@app.get("/readyz", response_class=JSONResponse)
-def readyz():
-    return {"ok": True, **_ready_probe()}
-
-
-@app.post("/cors-test", response_class=JSONResponse)
-async def cors_test():
-    return {"ok": True, "message": "CORS OK"}
-
-
-@app.options("/{path:path}")
-async def options_preflight(path: str):
-    from fastapi.responses import Response
-    return Response(status_code=204)
-    # === Lightweight health/CORS endpoints + lazy import + handlers ===
-from fastapi.responses import JSONResponse
-import importlib
-
-# /healthz super-leggero (per Render)
+# ----- Health/CORS super-leggeri -----
 @app.get("/healthz", response_class=JSONResponse)
 def healthz():
+    # IMPORTANTISSIMO: leggerissimo per Render
     return {"ok": True}
 
-# /readyz (diagnostico, NON usato da Render)
 from functools import lru_cache
 from time import perf_counter
 import shutil as _shutil
@@ -335,47 +306,24 @@ def _ready_probe():
         "elapsed_ms": int((perf_counter()-t0)*1000),
     }
 
+@app.get("/", response_class=JSONResponse)
+def root():
+    return {"ok": True, "service": "ai-video-detector", "version": VERSION}
+
 @app.get("/readyz", response_class=JSONResponse)
 def readyz():
     return {"ok": True, **_ready_probe()}
 
-# Banner root (facoltativo, utile)
-@app.get("/", response_class=JSONResponse)
-def root():
-    return {"ok": True, "service": "ai-video-detector", "version": globals().get("VERSION", "unknown")}
-
-# Preflight universale (CORS)
 @app.options("/{path:path}")
 async def options_preflight(path: str):
     from fastapi.responses import Response
     return Response(status_code=204)
 
-# CORS quick test dal frontend
 @app.post("/cors-test", response_class=JSONResponse)
 async def cors_test():
     return {"ok": True, "message": "CORS OK"}
 
-# Lazy import per librerie pesanti (evita cold-start lenti)
-_IMPORT_CACHE = {}
-def _lazy_import(name: str):
-    mod = _IMPORT_CACHE.get(name)
-    if mod is None:
-        mod = importlib.import_module(name)
-        _IMPORT_CACHE[name] = mod
-    return mod
-
-# Helper opzionali (usali nel codice dove richiesto: _np(), _sf(), _cv2())
-def _np():
-    return _lazy_import("numpy")
-
-def _sf():
-    return _lazy_import("soundfile")
-
-def _cv2():
-    return _lazy_import("cv2")
-
-# Handlers JSON puliti (422/HTTPException)
-from fastapi import HTTPException
+# ----- Exception handlers puliti -----
 from fastapi.exceptions import RequestValidationError
 from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
 
@@ -392,4 +340,3 @@ async def http_exception_handler(request, exc):
         status_code=exc.status_code,
         content={"detail": exc.detail if isinstance(exc.detail, (str, dict)) else str(exc)}
     )
-    
