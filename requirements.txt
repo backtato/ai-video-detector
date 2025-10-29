@@ -12,6 +12,6 @@ onnxruntime>=1.18,<1.19
 pymediainfo>=6.1,<7
 hachoir>=3.3,<3.4
 diskcache>=5.6,<5.7
-yt-dlp>=2025.1.1
+yt-dlp>=2024.10.0,<2026.0.0      # <— pin realistico e stabile
 scikit-learn>=1.5,<1.6
 matplotlib>=3.9,<3.10
