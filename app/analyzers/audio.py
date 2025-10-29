@@ -30,6 +30,21 @@ def _norm(x: np.ndarray) -> np.ndarray:
         return np.zeros_like(x)
     return (x - mn) / ptp
 
+def _clamp_timeline_to_duration(timeline: List[Dict[str, Any]], duration_s: float) -> List[Dict[str, Any]]:
+    """Evita bucket oltre la durata e taglia l’ultimo end alla durata esatta."""
+    if duration_s <= 0:
+        return []
+    out: List[Dict[str, Any]] = []
+    for b in timeline:
+        s = float(b.get("start", 0))
+        e = float(b.get("end", s + 1))
+        if s >= duration_s:
+            break
+        bb = dict(b)
+        bb["end"] = min(e, duration_s)
+        out.append(bb)
+    return out
+
 def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
     """
     Timeline per-secondo con features semplici + VAD leggero.
@@ -113,9 +128,12 @@ def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
         timeline = [{"start": i, "end": i + 1, "ai_score": float(np.clip(per_frames[i], 0.0, 1.0))}
                     for i in range(n_bins)]
 
+        # ⬅️ FIX: clamp alla durata reale
+        timeline = _clamp_timeline_to_duration(timeline, duration)
+
         return {
             "scores": {
-                "audio_mean": float(np.mean(per_frames)) if per_frames else 0.5,
+                "audio_mean": float(np.mean([b["ai_score"] for b in timeline])) if timeline else 0.5,
                 "tts_like": float(np.mean(flat_n)) if flat_n.size else 0.0,
                 "hnr_proxy": hnr_proxy,
             },
