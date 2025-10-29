@@ -94,6 +94,11 @@ def analyze(cv_path: str, src_fps: float, duration: float, max_seconds: int = 16
     d_norm = _clamp(dup_avg, 0.0, 1.0)
 
     v_base = 0.45 + 0.10 * (0.5 - m_norm) + 0.12 * b_norm + 0.08 * ba_norm + 0.15 * d_norm
+
+    # Offset pro-reale per scene pulite e stabili (handheld lento tipico)
+    if dup_avg < 0.10 and block_avg < 0.08 and band_avg < 0.08 and flow_avg > 1.0 and 5.0 <= motion_avg <= 12.0:
+        v_base -= 0.03
+
     v_base = _clamp(v_base, 0.25, 0.75)
 
     secs = int(np.ceil(min(duration or (n / sampled_fps), len(dups) / sampled_fps)))
