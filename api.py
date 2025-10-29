@@ -16,7 +16,7 @@ try:
     cv2.ocl.setUseOpenCL(False)
 except Exception:
     pass
-    
+
 from app.analyzers import audio as audio_an
 from app.analyzers import video as video_an
 from app.analyzers import forensic as forensic_an
@@ -150,7 +150,6 @@ def _analyze_file(path: str) -> Dict[str, Any]:
         video = video_an.analyze(path, basic["fps"], basic["duration"])
     else:
         video = {"timeline": [], "summary": {}}
-    # se l’analisi non produce timeline → trattalo come no video
     if not video.get("timeline"):
         video_has_signal = False
 
@@ -191,7 +190,7 @@ def _analyze_file(path: str) -> Dict[str, Any]:
         "timeline": _clamp_tl(audio.get("timeline") or [])
     }
 
-    # ---- DEVICE: unwrap se il detector ritorna {"device": {...}} ----
+    # DEVICE: unwrap se il detector ritorna {"device": {...}}
     dev = meta_an.detect_device(path) if hasattr(meta_an, "detect_device") else {"vendor": None, "model": None, "os": None}
     if isinstance(dev, dict) and "device" in dev and isinstance(dev["device"], dict):
         dev = dev["device"]
@@ -208,7 +207,6 @@ def _analyze_file(path: str) -> Dict[str, Any]:
     hints["motion_used"] = float(v_summary.get("motion_avg") or 0.0)
 
     hints = heur_an.build_hints(meta_out, video_out, audio_out, hints)
-
     fused = fusion_an.fuse(meta_out, hints, video_out, audio_out)
 
     out = {
@@ -234,7 +232,8 @@ async def analyze(file: UploadFile = File(...)):
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail={"error": "File troppo grande"})
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
+    # PATCH: usa estensione .mp4 per facilitare i demuxer
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     try:
         with open(tmp.name, "wb") as f:
             f.write(data)
@@ -276,6 +275,7 @@ async def predict(file: UploadFile = File(None), url: str = Form(None)):
         return await analyze_url(url=url)
     raise HTTPException(status_code=422, detail="Fornire file o url")
 
+# FACOLTATIVO: diagnostica CORS / preflight universale
 @app.get("/healthz")
 def healthz():
     return JSONResponse({"ok": True, "ffprobe": True, "exiftool": True, "version": "1.2.2", "author": "Backtato"})
