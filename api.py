@@ -36,17 +36,16 @@ YTDLP_OPTS           = os.getenv("YTDLP_OPTS", '{"noplaylist":true,"continuedl":
 # ==== APP ===================================================================
 app = FastAPI()
 
-cors_kwargs = {
-    "allow_credentials": True,
-    "allow_methods": ["*"],
-    "allow_headers": ["*"],
-}
-if ALLOWED_ORIGIN_REGEX:
-    cors_kwargs["allow_origin_regex"] = ALLOWED_ORIGIN_REGEX
-else:
-    cors_kwargs["allow_origins"] = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
-
-app.add_middleware(CORSMiddleware, **cors_kwargs)
+# CORS: se non configurato, consenti tutte le origini per evitare 405/blocked su preflight
+allowed_list = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_list if allowed_list else ["*"],
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX if ALLOWED_ORIGIN_REGEX else None,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ==== UTILS ================================================================
 
@@ -54,8 +53,10 @@ def _tmpdir(prefix: str = "aiv_") -> str:
     return tempfile.mkdtemp(prefix=prefix)
 
 def _cleanup_dir(path: str):
-    try: shutil.rmtree(path, ignore_errors=True)
-    except Exception: pass
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
 
 def _fail(status: int, error: str, **extra):
     payload = {"detail": {"error": error}}
@@ -156,13 +157,20 @@ def _analyze_file(path: str) -> Dict[str, Any]:
     ffj = _ffprobe_json(path)
     meta_base = _meta_from_ffprobe(ffj)
 
-    # meta esteso + forensic
-    meta_ext     = {"meta": meta_base}
-    meta_device  = meta_an.detect_device(path)
-    meta_c2pa    = meta_an.detect_c2pa(path)
-    forensic     = forensic_an.analyze(path)
+    # meta esteso + forensic (sempre con chiave 'present' booleana)
+    meta_ext = {"meta": meta_base}
+    try:
+        meta_device = meta_an.detect_device(path)
+    except Exception:
+        meta_device = {}
+    try:
+        meta_c2pa = meta_an.detect_c2pa(path)
+    except Exception:
+        meta_c2pa = {"present": False}
+
+    forensic = forensic_an.analyze(path)
     meta_ext.update(meta_device)
-    meta_ext["forensic"] = {"c2pa": meta_c2pa.get("present", False)}
+    meta_ext["forensic"] = {"c2pa": {"present": bool(meta_c2pa.get("present", False))}}
     meta_ext["ffprobe_raw"] = bool(ffj)
 
     # analysis
@@ -257,3 +265,8 @@ async def predict(
     if the_url:
         return await analyze_url(url=the_url)
     return _fail(415, "File vuoto o non ricevuto")
+
+# Preflight universale (risolve 405 su /predict e altre route custom)
+@app.options("/{path:path}")
+async def preflight(path: str):
+    return PlainTextResponse("OK", status_code=200)
