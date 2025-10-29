@@ -1,19 +1,29 @@
-bind = "0.0.0.0:8000"
+# gunicorn_conf.py — minimal, robust, Render-friendly
 
-# Conservativo: una sola pipeline pesante per volta
-workers = 1
+import os
+
+# Bind: Render/Docs -> 0.0.0.0:8000 (Dockerfile EXPOSE 8000)
+bind = os.getenv("GUNICORN_BIND", "0.0.0.0:8000")
+
+# Concurrency: one worker is safer on small instances
+workers = int(os.getenv("WEB_CONCURRENCY", "1"))
+threads = int(os.getenv("GUNICORN_THREADS", "1"))
 worker_class = "uvicorn.workers.UvicornWorker"
 
-# Allineati ai timeouts interni (yt-dlp 180s, ffmpeg 60s, ecc.)
-timeout = 300
-graceful_timeout = 60
-keepalive = 5
+# Startup/runtime safety
+preload_app = False
+timeout = int(os.getenv("GUNICORN_TIMEOUT", "180"))
+graceful_timeout = int(os.getenv("GUNICORN_GRACEFUL_TIMEOUT", "30"))
+keepalive = int(os.getenv("GUNICORN_KEEPALIVE", "2"))
 
-# Riciclo periodico per evitare leak/latenze accumulate in librerie native
-max_requests = 200
-max_requests_jitter = 20
+# Recycle to avoid memory bloat
+max_requests = int(os.getenv("GUNICORN_MAX_REQUESTS", "200"))
+max_requests_jitter = int(os.getenv("GUNICORN_MAX_REQUESTS_JITTER", "50"))
 
-# Log essenziali
+# Logging
 accesslog = "-"
 errorlog = "-"
-loglevel = "info"
+loglevel = os.getenv("GUNICORN_LOG_LEVEL", "info")
+
+# Networking hygiene
+forwarded_allow_ips = "*"
