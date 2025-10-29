@@ -1,7 +1,8 @@
 import cv2
 import numpy as np
+import math
 
-def _clamp(v, lo, hi): 
+def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def _blockiness_score(gray: np.ndarray) -> float:
@@ -21,10 +22,6 @@ def _optflow_mag(prev_gray, gray):
     return float(np.mean(mag))
 
 def analyze(cv_path: str, src_fps: float, duration: float, max_seconds: int = 16) -> dict:
-    """
-    Campionamento adattivo (fps campionati più alti su 30fps) per ridurre falsi duplicati.
-    Dup attenuato quando c'è motion/flow presente.
-    """
     cap = cv2.VideoCapture(cv_path)
     if not cap.isOpened():
         return {"timeline": [], "summary": {}}
@@ -34,14 +31,12 @@ def analyze(cv_path: str, src_fps: float, duration: float, max_seconds: int = 16
     fps = float(cap.get(cv2.CAP_PROP_FPS) or src_fps or 0.0)
     fps = fps if fps > 0 else (src_fps or 30.0)
 
-    # sampled_fps adattivo: più alto per 30fps (riduce dup artefatti)
     sampled_fps = 5.0 if fps >= 30.0 else 2.5
     step = max(1, int(round(fps / sampled_fps)))
 
     frames = []
     idx = 0
-    read = 0
-    limit_frames = int(min(duration, max_seconds) * fps)
+    limit_frames = int(min(duration, max_seconds) * fps) if duration and fps else 0
 
     while True:
         ret = cap.grab()
@@ -53,7 +48,6 @@ def analyze(cv_path: str, src_fps: float, duration: float, max_seconds: int = 16
                 break
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             frames.append(gray)
-            read += 1
         idx += 1
         if limit_frames and idx >= limit_frames:
             break
@@ -63,15 +57,9 @@ def analyze(cv_path: str, src_fps: float, duration: float, max_seconds: int = 16
     if n < 2:
         return {"timeline": [], "summary": {}}
 
-    timeline = []
-    opt_mags = []
-    motions = []
-    dups = []
-    blockiness = []
-    bandings = []
+    opt_mags, motions, dups, blockiness, bandings = [], [], [], [], []
 
     def _motion_proxy(a, b):
-        # differenza frame-frame
         return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16)))) / 255.0 * 100.0
 
     for i in range(1, n):
@@ -83,7 +71,6 @@ def analyze(cv_path: str, src_fps: float, duration: float, max_seconds: int = 16
         mot = _motion_proxy(prev, cur)
         motions.append(mot)
 
-        # duplicato se quasi identico (soglia adattiva: più permissiva se motion/flow presenti)
         diff = np.mean(np.abs(prev.astype(np.int16) - cur.astype(np.int16))) / 255.0
         dup = 1.0 if diff < 0.01 else 0.0
         dups.append(dup)
@@ -94,18 +81,13 @@ def analyze(cv_path: str, src_fps: float, duration: float, max_seconds: int = 16
     flow_avg = float(np.mean(opt_mags)) if opt_mags else 0.0
     motion_avg = float(np.mean(motions)) if motions else 0.0
 
-    # Attenua dup quando c'è movimento/flow (riduce falsi duplicati su scene stabili)
     if flow_avg > 1.0 or motion_avg > 22.0:
-        dups = [d * 0.6 for d in dups]  # attenuazione 40%
+        dups = [d * 0.6 for d in dups]  # attenuazione dup 40%
 
     dup_avg = float(np.mean(dups)) if dups else 0.0
     block_avg = float(np.mean(blockiness)) if blockiness else 0.0
     band_avg = float(np.mean(bandings)) if bandings else 0.0
 
-    # score video per-secondo (semplice ma stabile)
-    # dup ha peso ridotto; motion basso + banding/blockiness alti spingono su AI
-    v_scores = []
-    # normalizza alcune scale
     m_norm = _clamp(motion_avg / 40.0, 0.0, 1.0)
     b_norm = _clamp(block_avg / 0.5, 0.0, 1.0)
     ba_norm = _clamp(band_avg / 0.6, 0.0, 1.0)
@@ -114,11 +96,8 @@ def analyze(cv_path: str, src_fps: float, duration: float, max_seconds: int = 16
     v_base = 0.45 + 0.10 * (0.5 - m_norm) + 0.12 * b_norm + 0.08 * ba_norm + 0.15 * d_norm
     v_base = _clamp(v_base, 0.25, 0.75)
 
-    # costruisci timeline ai (per secondo)
-    secs = int(np.ceil(min(duration, len(dups) / sampled_fps)))
-    for s in range(secs):
-        v_scores.append(v_base)
-        timeline.append({"start": s, "end": s + 1, "ai_score": float(v_base)})
+    secs = int(np.ceil(min(duration or (n / sampled_fps), len(dups) / sampled_fps)))
+    timeline = [{"start": s, "end": s + 1, "ai_score": float(v_base)} for s in range(secs)]
 
     summary = {
         "y_mean_avg": None,
@@ -130,7 +109,4 @@ def analyze(cv_path: str, src_fps: float, duration: float, max_seconds: int = 16
         "optflow_mag_avg": float(flow_avg),
         "sampled_fps": float(sampled_fps),
     }
-    return {
-        "timeline": timeline,
-        "summary": summary
-    }
+    return {"timeline": timeline, "summary": summary}
