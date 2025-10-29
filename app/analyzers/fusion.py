@@ -4,6 +4,9 @@ from typing import Dict, Any, List, Tuple
 REAL_TH = 0.40   # soglia più "real-friendly"
 AI_TH   = 0.72
 
+# Soglia configurabile per picchi (stabilizza "peaks" su compressioni alte)
+MIN_PEAK_SCORE = float(os.getenv("MIN_PEAK_SCORE", "0.12"))
+
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -16,7 +19,10 @@ def _stdev(xs: List[float]) -> float:
     m = _mean(xs)
     return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
 
-def _local_peaks(xs: List[float], min_prom: float = 0.05, min_dist: int = 2, top_k: int = 6) -> List[Tuple[int, float]]:
+def _local_peaks(xs: List[float], min_prom: float = None, min_dist: int = 2, top_k: int = 6) -> List[Tuple[int, float]]:
+    # usa MIN_PEAK_SCORE come minimo, ma non scendere sotto 0.05
+    if min_prom is None:
+        min_prom = max(0.05, MIN_PEAK_SCORE)
     peaks = []
     n = len(xs)
     for i in range(1, n - 1):
@@ -125,22 +131,17 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
     flow_avg = (hints or {}).get("flow_used", 0.0)
     motion_avg = (hints or {}).get("motion_used", 0.0)
 
-    # ---- FIX: usare 'adjust' (non 'penalty') e sommare all'output ----
+    # Aggiustamenti conservativi
     adjust = 0.0
-
-    # 1) compressione pesante / bpp basso → spinge verso AI (punteggio su)
     if comp == "heavy" or bpp < 0.06:
         adjust += 0.06
-
-    # 2) molti duplicati ma con flow/motion reale → attenua (punteggio giù)
     if dup_avg >= 0.65 and ((flow_avg and flow_avg > 1.0) or (motion_avg and motion_avg > 22.0)):
         adjust -= 0.04
 
-    # 3) prior pro-reale per iPhone handheld con bpp ok, comp normale/bassa e movimento lento/presente
     device = (meta or {}).get("device") or {}
     if (device.get("vendor") == "Apple" or device.get("os") == "iOS") and (hints or {}).get("video_has_signal", False):
         if (bpp >= 0.08) and (comp in (None, "normal", "low")) and ((flow_avg and flow_avg > 1.0) or (motion_avg and motion_avg >= 5.0)):
-            adjust -= 0.05  # NEGATIVO => abbassa lo score (pro-reale)
+            adjust -= 0.05  # più favore al "real"
 
     fused_avg_adj = _clamp(fused_avg + adjust, 0.0, 1.0)
 
@@ -150,7 +151,7 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
     conf = int(_clamp(base_conf, 0.10, 0.99) * 100)
 
     label = _label_from_score(fused_avg_adj)
-    peaks = [{"t": i, "ai_score": v} for (i, v) in _local_peaks(fused, min_prom=0.05, min_dist=2, top_k=6)]
+    peaks = [{"t": i, "ai_score": v} for (i, v) in _local_peaks(fused, min_prom=None, min_dist=2, top_k=6)]
     reason = _reason_builder(hints, video or {}, audio or {}, fused_avg_adj, spread)
 
     return {
@@ -164,8 +165,3 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
         "peaks": peaks,
         "hints": hints or {}
     }
-
-# Added config: peak threshold
-MIN_PEAK_SCORE = float(os.getenv('MIN_PEAK_SCORE', '0.12'))
-# Soglia configurabile per picchi (stabilizza "peaks" su compressioni alte)
-MIN_PEAK_SCORE = float(os.getenv("MIN_PEAK_SCORE", "0.12"))
