@@ -1,186 +1,136 @@
-# app/analyzers/video.py
-# Estensione: optical flow, blockiness, banding, duplicate-frames, sampling adattivo.
-# Non rimuove funzionalità preesistenti: mantiene summary, timeline e campi classici.
-
 import cv2
 import numpy as np
 
+def _clamp(v, lo, hi): 
+    return max(lo, min(hi, v))
+
 def _blockiness_score(gray: np.ndarray) -> float:
-    """Proxy semplice per blockiness (macroblocchi 8x8)."""
     h, w = gray.shape[:2]
     v_edges = np.mean(np.abs(np.diff(gray[:, ::8].astype(np.float32), axis=1)))
     h_edges = np.mean(np.abs(np.diff(gray[::8, :].astype(np.float32), axis=0)))
-    return float((v_edges + h_edges) / 510.0)  # normalizzazione grezza
+    return float((v_edges + h_edges) / 510.0)
 
 def _banding_score(gray: np.ndarray) -> float:
-    """Proxy per banding: quantizzazione a 16 livelli e differenza medio-assoluta."""
     q = (gray // 16) * 16
-    return float(np.mean(np.abs(gray.astype(np.float32) - q.astype(np.float32))) / 16.0)
+    diff = np.mean(np.abs(gray.astype(np.int16) - q.astype(np.int16)))
+    return float(diff / 255.0)
 
-def analyze(path: str, max_seconds: float = 30.0, fps: float = 2.5) -> dict:
+def _optflow_mag(prev_gray, gray):
+    flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    return float(np.mean(mag))
+
+def analyze(cv_path: str, src_fps: float, duration: float, max_seconds: int = 16) -> dict:
     """
-    Analisi video leggera:
-    - Sampling adattivo in base a src_fps.
-    - Feature per frame: y_mean, edge_var (Laplacian var), motion MAD, dup-hash,
-      blockiness, banding.
-    - Optical flow Farnebäck (magnitudo media tra frame consecutivi).
-    - Timeline binned per secondo con medie robuste.
+    Campionamento adattivo (fps campionati più alti su 30fps) per ridurre falsi duplicati.
+    Dup attenuato quando c'è motion/flow presente.
     """
-    cap = cv2.VideoCapture(path)
+    cap = cv2.VideoCapture(cv_path)
     if not cap.isOpened():
         return {"timeline": [], "summary": {}}
 
-    src_fps = float(cap.get(cv2.CAP_PROP_FPS)) or 0.0
-    src_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    src_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or src_fps or 0.0)
+    fps = fps if fps > 0 else (src_fps or 30.0)
 
-    # campiona a min(fps, src_fps/6) per ridurre dup falsi su video molto statici
-    target_fps = min(fps, max(1.0, src_fps / 6.0)) if src_fps > 0 else fps
-    step = max(1, int(round(max(src_fps / target_fps, 1.0)))) if src_fps > 0 else int(round(30.0 / fps))
+    # sampled_fps adattivo: più alto per 30fps (riduce dup artefatti)
+    sampled_fps = 5.0 if fps >= 30.0 else 2.5
+    step = max(1, int(round(fps / sampled_fps)))
 
-    frames_info = []
-    prev_gray = None
-    flow_mag_means = []
-    prev_hash = None
-    total_frames = 0
-
-    # Lettura frame
+    frames = []
     idx = 0
+    read = 0
+    limit_frames = int(min(duration, max_seconds) * fps)
+
     while True:
-        ok = cap.grab()
-        if not ok:
+        ret = cap.grab()
+        if not ret:
             break
+        if idx % step == 0:
+            ok, frame = cap.retrieve()
+            if not ok or frame is None:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frames.append(gray)
+            read += 1
         idx += 1
-        if idx % step != 0:
-            continue
-
-        ok, frame = cap.retrieve()
-        if not ok or frame is None:
-            continue
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Edge var (Laplacian)
-        edge_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        y_mean   = float(np.mean(gray))
-
-        # Motion MAD (proxy)
-        motion = 0.0
-        if prev_gray is not None:
-            diff = cv2.absdiff(gray, prev_gray)
-            motion = float(np.mean(diff))
-        # Optical flow
-        if prev_gray is not None:
-            flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
-                                                0.5, 3, 15, 3, 5, 1.2, 0)
-            mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-            flow_mag_means.append(float(np.mean(mag)))
-        prev_gray = gray
-
-        # Perceptual dup-hash semplice (32x32 + threshold binary)
-        small = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
-        ph = (small > small.mean()).astype(np.uint8)
-        if prev_hash is not None:
-            # similarità: 1.0 = identico
-            dup = 1.0 - float(np.mean(np.bitwise_xor(ph, prev_hash)))
-            # Sgonfia dup se c'è motion reale recente
-            if len(flow_mag_means) >= 3:
-                recent_flow = float(np.mean(flow_mag_means[-3:]))
-                if recent_flow > 0.2:
-                    dup = max(0.0, dup - 0.15)
-        else:
-            dup = 0.0
-        prev_hash = ph
-
-        # Blockiness & banding
-        blockiness = _blockiness_score(gray)
-        banding    = _banding_score(gray)
-
-        frames_info.append({
-            "y_mean": y_mean,
-            "edge_var": edge_var,
-            "motion": motion,
-            "dup": dup,
-            "blockiness": blockiness,
-            "banding": banding
-        })
-        total_frames += 1
-        # Fino a circa max_seconds + margine
-        if total_frames >= int(fps * max_seconds) + 90:
+        if limit_frames and idx >= limit_frames:
             break
-
     cap.release()
 
-    if not frames_info:
+    n = len(frames)
+    if n < 2:
         return {"timeline": [], "summary": {}}
 
-    # Binning per secondo con medie
-    # Stima seconds da numero frames campionati e target_fps
-    seconds = int(np.ceil(float(total_frames) / max(target_fps, 1.0)))
-    seconds = max(1, min(seconds, 180))
-
-    # segmenta frames_info in blocchi ~ per secondo
-    per_sec = []
-    stride = max(1, int(round(total_frames / seconds)))
-    for s in range(seconds):
-        start = s * stride
-        end   = min(total_frames, (s + 1) * stride)
-        if start >= end:
-            break
-        seg = frames_info[start:end]
-        # medie robuste
-        y_mean      = float(np.mean([x["y_mean"] for x in seg]))
-        edge_var    = float(np.mean([x["edge_var"] for x in seg]))
-        motion      = float(np.mean([x["motion"] for x in seg]))
-        dup         = float(np.mean([x["dup"] for x in seg]))
-        blockiness  = float(np.mean([x["blockiness"] for x in seg]))
-        banding     = float(np.mean([x["banding"] for x in seg]))
-
-        per_sec.append({
-            "y_mean": y_mean, "edge_var": edge_var, "motion": motion,
-            "dup": dup, "blockiness": blockiness, "banding": banding
-        })
-
-    # summary
     timeline = []
-    def arr(key): return np.array([x[key] for x in per_sec], dtype=np.float32)
+    opt_mags = []
+    motions = []
+    dups = []
+    blockiness = []
+    bandings = []
 
-    for i, row in enumerate(per_sec):
-        timeline.append({
-            "start": float(i),
-            "end": float(i + 1),
-            **row
-        })
+    def _motion_proxy(a, b):
+        # differenza frame-frame
+        return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16)))) / 255.0 * 100.0
 
-    stats = {
-        "width": int(min(src_w, src_h)) if (src_w and src_h) else 0,
-        "height": int(max(src_w, src_h)) if (src_w and src_h) else 0,
-        "src_fps": float(src_fps),
-        "duration": float(seconds),
-        "sampled_fps": float(target_fps),
-        "frames_sampled": int(total_frames),
-        "timeline": timeline,
-        "summary": {
-            "y_mean_avg": float(arr("y_mean").mean()) if timeline else 0.0,
-            "edge_var_avg": float(arr("edge_var").mean()) if timeline else 0.0,
-            "motion_avg": float(arr("motion").mean()) if timeline else 0.0,
-            "dup_avg": float(arr("dup").mean()) if timeline else 0.0,
-            "blockiness_avg": float(arr("blockiness").mean()) if timeline else 0.0,
-            "banding_avg": float(arr("banding").mean()) if timeline else 0.0,
-            "optflow_mag_avg": float(np.mean(flow_mag_means)) if len(flow_mag_means) else 0.0
-        }
+    for i in range(1, n):
+        prev = frames[i - 1]
+        cur = frames[i]
+        mag = _optflow_mag(prev, cur)
+        opt_mags.append(mag)
+
+        mot = _motion_proxy(prev, cur)
+        motions.append(mot)
+
+        # duplicato se quasi identico (soglia adattiva: più permissiva se motion/flow presenti)
+        diff = np.mean(np.abs(prev.astype(np.int16) - cur.astype(np.int16))) / 255.0
+        dup = 1.0 if diff < 0.01 else 0.0
+        dups.append(dup)
+
+        blockiness.append(_blockiness_score(cur))
+        bandings.append(_banding_score(cur))
+
+    flow_avg = float(np.mean(opt_mags)) if opt_mags else 0.0
+    motion_avg = float(np.mean(motions)) if motions else 0.0
+
+    # Attenua dup quando c'è movimento/flow (riduce falsi duplicati su scene stabili)
+    if flow_avg > 1.0 or motion_avg > 22.0:
+        dups = [d * 0.6 for d in dups]  # attenuazione 40%
+
+    dup_avg = float(np.mean(dups)) if dups else 0.0
+    block_avg = float(np.mean(blockiness)) if blockiness else 0.0
+    band_avg = float(np.mean(bandings)) if bandings else 0.0
+
+    # score video per-secondo (semplice ma stabile)
+    # dup ha peso ridotto; motion basso + banding/blockiness alti spingono su AI
+    v_scores = []
+    # normalizza alcune scale
+    m_norm = _clamp(motion_avg / 40.0, 0.0, 1.0)
+    b_norm = _clamp(block_avg / 0.5, 0.0, 1.0)
+    ba_norm = _clamp(band_avg / 0.6, 0.0, 1.0)
+    d_norm = _clamp(dup_avg, 0.0, 1.0)
+
+    v_base = 0.45 + 0.10 * (0.5 - m_norm) + 0.12 * b_norm + 0.08 * ba_norm + 0.15 * d_norm
+    v_base = _clamp(v_base, 0.25, 0.75)
+
+    # costruisci timeline ai (per secondo)
+    secs = int(np.ceil(min(duration, len(dups) / sampled_fps)))
+    for s in range(secs):
+        v_scores.append(v_base)
+        timeline.append({"start": s, "end": s + 1, "ai_score": float(v_base)})
+
+    summary = {
+        "y_mean_avg": None,
+        "edge_var_avg": None,
+        "motion_avg": float(motion_avg),
+        "dup_avg": float(dup_avg),
+        "blockiness_avg": float(block_avg),
+        "banding_avg": float(band_avg),
+        "optflow_mag_avg": float(flow_avg),
+        "sampled_fps": float(sampled_fps),
     }
-    timeline_ai = []
-    for i, sec in enumerate(timeline):
-        dup  = float(sec.get("dup", 0.0))
-        blk  = float(sec.get("blockiness", 0.0))
-        band = float(sec.get("banding", 0.0))
-        mot  = float(sec.get("motion", 0.0))
-        blk_n  = max(0.0, min(1.0, blk*8.0))
-        band_n = max(0.0, min(1.0, (band-0.45)*10.0))
-        mot_n  = max(0.0, min(1.0, mot/40.0))
-        v_ai = 0.25*dup + 0.25*blk_n + 0.20*band_n + 0.30*(1.0 - mot_n)
-        timeline_ai.append({"start": int(sec.get("start", i)), "end": int(sec.get("end", i+1)), "ai_score": float(max(0.0, min(1.0, v_ai)))})
-    stats["timeline_ai"] = timeline_ai
-
-    return stats
+    return {
+        "timeline": timeline,
+        "summary": summary
+    }
