@@ -30,7 +30,7 @@ VERSION             = os.getenv("VERSION", "1.2.0")
 # ==== App ====
 app = FastAPI(title="AI-Video Detector", version=VERSION)
 
-# CORS: se ALLOWED_ORIGINS non è "*", splitta per virgola; altrimenti apri a tutti
+# CORS
 if ALLOWED_ORIGINS_ENV.strip() == "*":
     cors_origins = ["*"]
 else:
@@ -44,7 +44,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==== Import locali (dopo init app) ====
+# ==== Import locali ====
 from app.analyzers import audio as audio_an
 from app.analyzers import video as video_an
 from app.analyzers import fusion as fusion_an
@@ -60,9 +60,6 @@ def _fail(status: int, msg: str, extra: Dict[str, Any] = None) -> JSONResponse:
     if extra:
         payload["detail"].update(extra)
     return JSONResponse(payload, status_code=status)
-
-def _read_n_bytes(stream: io.BufferedReader, n: int) -> bytes:
-    return stream.read(n)
 
 def _is_hls_url(u: str) -> bool:
     return ".m3u8" in u.lower() or re.search(r"format=(?:hls|m3u8)", u, re.I) is not None
@@ -82,9 +79,6 @@ def _exiftool_ok() -> bool:
         return False
 
 async def _download_with_httpx(url: str, out_path: str) -> Dict[str, Any]:
-    """
-    Download binario via httpx con sniff del Content-Type e guardie dimensione.
-    """
     timeout = httpx.Timeout(REQUEST_TIMEOUT_S)
     async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
         r = await client.get(url)
@@ -99,7 +93,6 @@ async def _download_with_httpx(url: str, out_path: str) -> Dict[str, Any]:
         if size and size > RESOLVER_MAX_BYTES:
             return {"ok": False, "status": 413, "why": f"File troppo grande ({size} > {RESOLVER_MAX_BYTES})"}
 
-        # streaming su disco
         total = 0
         with open(out_path, "wb") as f:
             async for chunk in r.aiter_bytes():
@@ -113,10 +106,6 @@ async def _download_with_httpx(url: str, out_path: str) -> Dict[str, Any]:
     return {"ok": True, "status": 200, "ctype": ctype or "", "path": out_path}
 
 def _yt_dlp_direct_url(url: str) -> Dict[str, Any]:
-    """
-    Prova ad ottenere un URL diretto allo stream con yt-dlp -g.
-    Richiede USE_YTDLP=1. Supporta opzioni JSON in YTDLP_OPTS.
-    """
     ytopts = {}
     try:
         if YTDLP_OPTS:
@@ -141,11 +130,9 @@ def _yt_dlp_direct_url(url: str) -> Dict[str, Any]:
     if not direct:
         return {"ok": False, "status": 422, "why": "yt-dlp non ha fornito URL diretto"}
 
-    # scegli il primo non-HLS
     for u in direct:
         if not _is_hls_url(u):
             return {"ok": True, "status": 200, "direct": u}
-    # se solo HLS e blocchiamo HLS:
     if BLOCK_HLS:
         return {"ok": False, "status": 415, "why": "Solo HLS disponibili; abilita HLS o usa upload/registrazione"}
     return {"ok": True, "status": 200, "direct": direct[0]}
@@ -158,14 +145,30 @@ def _label_from_score(score: float) -> str:
     return "uncertain"
 
 def _confidence_from_payload(p: Dict[str, Any]) -> int:
-    # semplice euristica: clamp 10..99, usa spread dei punteggi + qualità
     try:
         conf = p.get("result", {}).get("confidence", None)
         if conf is not None:
             return int(conf)
     except Exception:
         pass
-    return 70  # fallback coerente con tua UI
+    return 70  # fallback
+
+# === Bitrate/BPP helpers ===
+def _infer_bitrate(meta: dict, file_size_bytes: int) -> int:
+    br = int(meta.get("bit_rate") or 0)
+    dur = float(meta.get("duration") or 0.0)
+    if br <= 0 and file_size_bytes and dur > 0:
+        br = int((file_size_bytes * 8) / dur)  # bit/s
+    return br
+
+def _compute_bpp(meta: dict, br_bits_per_s: int) -> float:
+    w = int(meta.get("width") or 0)
+    h = int(meta.get("height") or 0)
+    fps = float(meta.get("fps") or 0.0)
+    if br_bits_per_s <= 0 or w <= 0 or h <= 0 or fps <= 0:
+        return 0.0
+    # bits per pixel per frame ~ bitrate / (fps * pixels_per_frame)
+    return float(br_bits_per_s) / (fps * (w * h))
 
 # ==== HEALTH ====
 @app.get("/healthz")
@@ -188,17 +191,12 @@ async def cors_test(request: Request):
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     try:
-        # 1) file guardie
         if not file or not file.filename:
             return _fail(415, "File vuoto o non ricevuto")
 
-        # type sniff
         mime = file.content_type or mimetypes.guess_type(file.filename)[0] or ""
-        if "video" not in mime and "quicktime" not in mime and not file.filename.lower().endswith((".mp4",".mov",".m4v",".mkv",".webm",".avi",".3gp",".3g2",".ts",".mts",".wmv",".flv")):
-            # non blocchiamo troppo: può capitare che i browser mandino octet-stream
-            pass
+        # non blocchiamo "octet-stream": browser spesso usano quello
 
-        # 2) salva su disco
         tmpd = _tmpdir("up_")
         path = os.path.join(tmpd, file.filename.replace("/", "_"))
         size = 0
@@ -214,10 +212,9 @@ async def analyze(file: UploadFile = File(...)):
                     return _fail(413, "File troppo grande", {"max_bytes": MAX_UPLOAD_BYTES})
                 f.write(chunk)
 
-        # 3) analisi
         return _analyze_file(path)
 
-    except Exception as e:
+    except Exception:
         return _fail(500, "Errore interno (analyze)", {"trace": traceback.format_exc()[:1200]})
 
 # ==== ANALYZE-URL ====
@@ -234,17 +231,14 @@ async def analyze_url(url: str = Form(...)):
         tmpd = _tmpdir("dl_")
         out = os.path.join(tmpd, "media.bin")
 
-        # 1) tenta yt-dlp se abilitato
         if USE_YTDLP:
             r = _yt_dlp_direct_url(url)
             if r.get("ok"):
                 url = r["direct"]
             else:
-                # rate-limit / login-wall → messaggio guidato
                 why = r.get("why", "Impossibile risolvere l'URL con yt-dlp")
                 return _fail(r.get("status", 422), why, {"hint": "Usa 'Carica file' o 'Registra 10s' se il link è protetto"})
 
-        # 2) download diretto
         got = await _download_with_httpx(url, out)
         if not got.get("ok"):
             return _fail(got.get("status", 415), got.get("why", "Download fallito"))
@@ -253,10 +247,9 @@ async def analyze_url(url: str = Form(...)):
         if ("text/html" in ctype) or (not ctype and not out.lower().endswith((".mp4",".mov",".m4v",".mkv",".webm",".avi",".3gp",".3g2",".ts",".mts",".wmv",".flv"))):
             return _fail(415, "Non sembra un file video diretto", {"content_type": ctype, "hint": "Se è un social protetto, usa upload/registrazione o abilita yt-dlp con cookie"})
 
-        # 3) analisi
         return _analyze_file(out, source_url=url)
 
-    except Exception as e:
+    except Exception:
         return _fail(500, "Errore interno (analyze-url)", {"trace": traceback.format_exc()[:1200]})
 
 # ==== PREDICT (retro-compatibile) ====
@@ -267,11 +260,6 @@ async def predict(
     link: Optional[str]      = Form(None),
     q: Optional[str]         = Form(None),
 ):
-    """
-    Smista:
-      - se arriva un file → /analyze
-      - se arriva un URL → /analyze-url
-    """
     if file is not None:
         return await analyze(file=file)
     the_url = (url or link or q or "").strip()
@@ -279,36 +267,30 @@ async def predict(
         return await analyze_url(url=the_url)
     return _fail(415, "File vuoto o non ricevuto")
 
-# ==== Preflight universale (copre ogni path OPTIONS) ====
+# ==== Preflight universale ====
 @app.options("/{path:path}")
 async def preflight(path: str):
     return PlainTextResponse("OK", status_code=200)
 
 # ==== Core analysis ====
 def _analyze_file(path: str, source_url: Optional[str] = None) -> JSONResponse:
-    # forense leggera + device + c2pa (fault-tolerant)
-    forensic = {}
+    # forense leggera + device + c2pa
     try:
         forensic = forensic_an.analyze(path)
     except Exception:
         forensic = {"c2pa": {"present": False}}
 
-    meta_device = {}
     try:
         meta_device = meta_an.detect_device(path)
     except Exception:
         meta_device = {"device": {"vendor": None, "model": None, "os": "Unknown"}}
 
-    c2pa = {}
     try:
         c2pa = meta_an.detect_c2pa(path)
     except Exception:
         c2pa = {"present": False, "note": "c2pa non determinato"}
 
     # video / audio
-    vstats = {}
-    astats = {}
-    meta = {}
     try:
         vstats = video_an.analyze(path) or {}
     except Exception:
@@ -317,8 +299,9 @@ def _analyze_file(path: str, source_url: Optional[str] = None) -> JSONResponse:
         astats = audio_an.analyze(path) or {}
     except Exception:
         astats = {}
+
+    # meta essenziali per UI
     try:
-        # riduci metadati essenziali per UI
         meta = {
             "width":  int(vstats.get("width") or 0),
             "height": int(vstats.get("height") or 0),
@@ -336,18 +319,51 @@ def _analyze_file(path: str, source_url: Optional[str] = None) -> JSONResponse:
     except Exception:
         meta = {"source_url": source_url, "resolved_url": source_url}
 
-    # fusione conservativa
-    fused = {}
+    # ==== Hints (bpp/compressione, signal) ====
     try:
-        fused = fusion_an.fuse(video_stats=vstats, audio_stats=astats, meta=meta, c2pa=c2pa)
+        file_size_bytes = os.path.getsize(path)
     except Exception:
-        # fallback neutro
-        fused = {
-            "result": {"label": "uncertain", "ai_score": 0.5, "confidence": 60, "reason": "analisi parziale"},
-            "timeline_binned": [],
-            "peaks": [],
-            "hints": {}
-        }
+        file_size_bytes = 0
+
+    bitrate = _infer_bitrate(meta, file_size_bytes)
+    bpp = _compute_bpp(meta, bitrate)
+
+    compression = "normal"
+    if bpp < 0.06:
+        compression = "heavy"
+    elif bpp < 0.10:
+        compression = "moderate"
+
+    # segnali video riassunti (se disponibili)
+    vsummary = vstats.get("summary") or {}
+    motion_used = float(vsummary.get("motion_avg") or 0.0)
+    flow_used = float(vsummary.get("optflow_mag_avg") or 0.0)
+    video_has_signal = bool(vstats.get("timeline_ai"))
+
+    hints = {
+        "bpp": round(bpp, 5),
+        "compression": compression,
+        "video_has_signal": video_has_signal,
+        "flow_used": flow_used,
+        "motion_used": motion_used,
+        "w": meta.get("width") or 0,
+        "h": meta.get("height") or 0,
+        "fps": meta.get("fps") or 0.0,
+        "br": bitrate or 0
+    }
+
+    # ==== Fusione conservativa (per-secondo reale) ====
+    try:
+        fused = fusion_an.fuse(video=vstats, audio=astats, hints=hints)
+        result = fused.get("result", {})
+        timeline_binned = fused.get("timeline_binned", [])
+        peaks = fused.get("peaks", [])
+        hints_out = fused.get("hints", hints)
+    except Exception:
+        result = {"label": "uncertain", "ai_score": 0.5, "confidence": 60, "reason": "analisi parziale"}
+        timeline_binned = []
+        peaks = []
+        hints_out = hints
 
     payload = {
         "ok": True,
@@ -355,12 +371,13 @@ def _analyze_file(path: str, source_url: Optional[str] = None) -> JSONResponse:
         "forensic": {"c2pa": {"present": bool(c2pa.get("present"))}},
         "video": vstats or {},
         "audio": astats or {},
-        "hints": fused.get("hints", {}),
-        "result": fused.get("result", {}),
-        "timeline_binned": fused.get("timeline_binned", []),
-        "peaks": fused.get("peaks", []),
+        "hints": hints_out,
+        "result": result,
+        "timeline_binned": timeline_binned,
+        "peaks": peaks,
     }
-    # UI-friendly clamp
+
+    # UI-friendly clamp (fallbacks)
     payload["result"]["label"] = payload["result"].get("label") or _label_from_score(payload["result"].get("ai_score", 0.5))
     payload["result"]["confidence"] = _confidence_from_payload(payload)
 
