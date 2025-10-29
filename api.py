@@ -6,7 +6,7 @@ import tempfile
 import traceback
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -36,7 +36,7 @@ YTDLP_OPTS           = os.getenv("YTDLP_OPTS", '{"noplaylist":true,"continuedl":
 # ==== APP ===================================================================
 app = FastAPI()
 
-# CORS: se non configurato, consenti tutte le origini per evitare 405/blocked su preflight
+# CORS: se non configurato, consenti tutte le origini
 allowed_list = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -198,6 +198,17 @@ def _analyze_file(path: str) -> Dict[str, Any]:
 async def healthz():
     return PlainTextResponse("ok")
 
+# Endpoint diagnostico CORS: accetta GET/POST/OPTIONS per evitare 405
+@app.api_route("/cors-test", methods=["GET", "POST", "OPTIONS"])
+async def cors_test(request: Request):
+    return JSONResponse({
+        "ok": True,
+        "method": request.method,
+        "origin": request.headers.get("origin"),
+        "access_control_request_method": request.headers.get("access-control-request-method"),
+        "access_control_request_headers": request.headers.get("access-control-request-headers"),
+    })
+
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     if not file or not file.filename:
@@ -266,7 +277,7 @@ async def predict(
         return await analyze_url(url=the_url)
     return _fail(415, "File vuoto o non ricevuto")
 
-# Preflight universale (risolve 405 su /predict e altre route custom)
+# Preflight universale (copre ogni path OPTIONS)
 @app.options("/{path:path}")
 async def preflight(path: str):
     return PlainTextResponse("OK", status_code=200)
