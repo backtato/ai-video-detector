@@ -279,3 +279,36 @@ async def predict(file: UploadFile = File(None), url: str = Form(None)):
 @app.get("/healthz")
 def healthz():
     return JSONResponse({"ok": True, "ffprobe": True, "exiftool": True, "version": "1.2.2", "author": "Backtato"})
+
+# === Health/CORS minimal endpoints inserted ===
+
+@app.get("/", response_class=JSONResponse)
+def root():
+    return {"ok": True, "service": "ai-video-detector", "version": VERSION}
+
+
+from functools import lru_cache
+from time import perf_counter
+import shutil as _shutil
+
+@lru_cache(maxsize=1)
+def _ready_probe():
+    t0 = perf_counter()
+    ffprobe = _shutil.which("ffprobe") is not None
+    exiftool = _shutil.which("exiftool") is not None
+    return {"ffprobe_found": ffprobe, "exiftool_found": exiftool, "elapsed_ms": int((perf_counter()-t0)*1000)}
+
+@app.get("/readyz", response_class=JSONResponse)
+def readyz():
+    return {"ok": True, **_ready_probe()}
+
+
+@app.post("/cors-test", response_class=JSONResponse)
+async def cors_test():
+    return {"ok": True, "message": "CORS OK"}
+
+
+@app.options("/{path:path}")
+async def options_preflight(path: str):
+    from fastapi.responses import Response
+    return Response(status_code=204)
