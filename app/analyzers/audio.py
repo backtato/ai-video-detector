@@ -14,8 +14,9 @@ def _extract_wav(path: str, sr: int = 16000) -> str:
     tmp = tempfile.mkdtemp(prefix="aud_")
     out = os.path.join(tmp, "audio.wav")
     cmd = [
-        "ffmpeg","-y","-i",path,"-ac","1","-ar",str(sr),
-        "-map_metadata","-1","-vn","-sn","-dn",out
+        "ffmpeg", "-y", "-i", path,
+        "-ac", "1", "-ar", str(sr),
+        "-map_metadata", "-1", "-vn", "-sn", "-dn", out
     ]
     _run(cmd)
     return out
@@ -31,8 +32,8 @@ def _norm(x: np.ndarray) -> np.ndarray:
 
 def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
     """
-    Audio timeline per-secondo (RMS, flatness, ZCR) + VAD leggero.
-    Cap dell'impatto AI quando non c'è voce evidente.
+    Timeline per-secondo con features semplici + VAD leggero.
+    In assenza di voce, limita l'impatto dei pattern "tts-like".
     """
     wav = _extract_wav(path, sr=target_sr)
     flags: List[str] = []
@@ -72,25 +73,23 @@ def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
         zcr_n   = _norm(zcr)
         roll_n  = _norm(roll)
 
-        # VAD grezzo: voce se energia > mediana e rolloff non troppo alto (meno rumore/vento)
+        # VAD grezzo: voce se energia > mediana e rolloff non troppo alto
         energy_med = float(np.median(rms))
         vad = (rms > (energy_med * 1.15)) & (roll_n < 0.75)
         vad_ratio = float(np.mean(vad)) if vad.size else 0.0
 
-        # “HNR proxy” semplice: dinamica energia vs flatness
+        # HNR proxy: dinamica energia vs flatness
         hnr_proxy = float(np.clip((np.std(rms_n) + (1.0 - np.mean(flat_n))) / 2.0, 0.0, 1.0))
 
-        # AI score per-secondo
-        # Se non c'è voce, limitiamo il peso di flatness/RMS come TTS-like.
+        # AI per-secondo (euristica conservativa)
         ai_per_sec = (
             0.35 * flat_n +
             0.30 * (1.0 - rms_n) +
             0.20 * (1.0 - np.clip(np.std(rms_n), 0.0, 1.0)) +
             0.15 * (1.0 - np.clip(np.std(zcr_n), 0.0, 1.0))
-        )
-        ai_per_sec = np.asarray(ai_per_sec, dtype=float)
+        ).astype(float)
 
-        # Cap se no-voice (per evitare falsi positivi su rumore/NR)
+        # In assenza di voce, cap per evitare falsi positivi da rumore/NR
         if vad_ratio < 0.25:
             flags.append("low_voice_presence")
             ai_per_sec = np.minimum(ai_per_sec, 0.60)
@@ -104,17 +103,15 @@ def analyze(path: str, target_sr: int = 16000) -> Dict[str, Any]:
         if energy_mean < 1e-3:
             flags.append("very_low_energy")
 
+        # Timeline per-secondo
         n_bins = int(np.ceil(duration))
         n_bins = max(1, min(n_bins, 180))
-        per_frames = ai_per_sec.tolist()
-        if len(per_frames) == 0:
-            per_frames = [0.5]
+        per_frames = ai_per_sec.tolist() or [0.5]
         if len(per_frames) < n_bins:
-            per_frames = per_frames + [per_frames[-1]] * (n_bins - len(per_frames))
+            per_frames += [per_frames[-1]] * (n_bins - len(per_frames))
 
-        timeline = []
-        for i in range(n_bins):
-            timeline.append({"start": i, "end": i+1, "ai_score": float(np.clip(per_frames[i], 0.0, 1.0))})
+        timeline = [{"start": i, "end": i + 1, "ai_score": float(np.clip(per_frames[i], 0.0, 1.0))}
+                    for i in range(n_bins)]
 
         return {
             "scores": {
