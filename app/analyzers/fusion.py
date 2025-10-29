@@ -1,5 +1,3 @@
-# app/analyzers/fusion.py
-
 from typing import Dict, Any, List, Tuple
 import math
 
@@ -31,18 +29,15 @@ def _smooth(xs: List[float], w: int = 3) -> List[float]:
     return out
 
 def _local_peaks(xs: List[float], min_prom: float = 0.04, min_dist: int = 2, top_k: int = 6) -> List[Tuple[int, float]]:
-    # semplice peak picking con prominence
     n = len(xs)
     peaks = []
     for i in range(1, n - 1):
         if xs[i] > xs[i - 1] and xs[i] >= xs[i + 1]:
-            # prominence
             left_min = min(xs[max(0, i - 10):i]) if i > 0 else xs[i]
             right_min = min(xs[i + 1:min(n, i + 11)]) if i + 1 < n else xs[i]
             prom = xs[i] - max(left_min, right_min)
             if prom >= min_prom:
                 peaks.append((i, xs[i], prom))
-    # enforce min distance
     peaks.sort(key=lambda t: t[1], reverse=True)
     filtered = []
     for p in peaks:
@@ -52,98 +47,89 @@ def _local_peaks(xs: List[float], min_prom: float = 0.04, min_dist: int = 2, top
             break
     return [(i, v) for (i, v, _) in filtered]
 
+def _mean_from_series(series: List[Dict[str, Any]], key="ai_score") -> float:
+    if not series:
+        return 0.5
+    return _mean([float(b.get(key, 0.5)) for b in series])
+
 def _reason_builder(hints: Dict[str, Any], video: Dict[str, Any], audio: Dict[str, Any], fused_avg: float, spread: float) -> str:
     parts = []
-    # compressione / bpp / duplicati
-    comp = hints.get("compression") or ("heavy" if (hints.get("bpp", 0) < 0.08) else None)
+    comp = hints.get("compression")
     if comp == "heavy":
         parts.append("compressione pesante")
     elif comp == "moderate":
         parts.append("compressione moderata")
 
-    dup = video.get("summary", {}).get("dup_avg")
-    if isinstance(dup, (int, float)) and dup >= 0.5:
+    dup = (video.get("summary") or {}).get("dup_avg")
+    if isinstance(dup, (int, float)) and dup >= 0.6:
         parts.append("molti frame duplicati")
 
-    # accordo/disaccordo tra audio e video
-    v_avg = _mean([b.get("ai_score", 0.5) for b in video.get("timeline_ai", [])]) or 0.5
-    a_avg = _mean([b.get("ai_score", 0.5) for b in audio.get("timeline", [])]) or 0.5
+    v_avg = _mean_from_series(video.get("timeline_ai", []))
+    a_avg = _mean_from_series(audio.get("timeline", []))
     dv = abs(v_avg - a_avg)
     if dv < 0.07:
         parts.append("segnali audio/video concordi")
     else:
         parts.append("segnali misti audio/video")
 
-    # spread informativo
     if spread < 0.04:
         parts.append("variazioni minime nel tempo")
     elif spread > 0.12:
         parts.append("variazioni marcate nel tempo")
 
-    base = " ; ".join(parts) if parts else "segnali neutri"
-    return base
+    return " ; ".join(parts) if parts else "segnali neutri"
 
 def fuse(video: Dict[str, Any], audio: Dict[str, Any], hints: Dict[str, Any]) -> Dict[str, Any]:
     # Serie per-secondo
     v_series = [b.get("ai_score", 0.5) for b in video.get("timeline_ai", [])]
     a_series = [b.get("ai_score", 0.5) for b in audio.get("timeline", [])]
 
-    # allinea alle stesse lunghezze
     L = min(len(v_series), len(a_series)) if v_series and a_series else max(len(v_series), len(a_series))
     if L == 0:
-        # fallback neutro
         return {
-            "ai_score": 0.5,
-            "label": "uncertain",
-            "confidence": 35,
+            "result": {"ai_score": 0.5, "label": "uncertain", "confidence": 35, "reason": "dati insufficienti"},
             "timeline_binned": [],
             "peaks": [],
-            "reason": "dati insufficienti"
+            "hints": hints or {}
         }
     v_series = (v_series[:L] if v_series else [0.5] * L)
     a_series = (a_series[:L] if a_series else [0.5] * L)
 
-    # smoothing leggero
     v_s = _smooth(v_series, 3)
     a_s = _smooth(a_series, 3)
 
     # pesi conservativi
     w_audio = 0.65
     w_video = 0.25
-    # small boost direzionale (0.10) quando trend concorde
+
     fused = []
     for va, aa in zip(v_s, a_s):
         boost = 0.10 if ((va - 0.5) * (aa - 0.5) > 0) else 0.0
         fx = w_audio * aa + w_video * va + boost * ((va + aa) / 2 - 0.5)
         fused.append(_clamp(fx, 0.0, 1.0))
 
-    # statistiche
     fused_avg = _mean(fused)
     spread = _stdev(fused)
 
-    # penalità compressione e duplicati
+    # penalità da hints
     bpp = hints.get("bpp") or 0.0
     comp = hints.get("compression")
-    dup_avg = video.get("summary", {}).get("dup_avg", 0.0)
+    dup_avg = (video.get("summary") or {}).get("dup_avg", 0.0)
 
     penalty = 0.0
     if comp == "heavy" or bpp < 0.06:
         penalty += 0.06
     elif comp == "moderate" or bpp < 0.10:
         penalty += 0.03
-
     if isinstance(dup_avg, (int, float)) and dup_avg >= 0.6:
         penalty += 0.03
 
     fused_avg_pen = _clamp(fused_avg - 0.5 * penalty, 0.0, 1.0)
 
-    # confidenza: da spread (più spread => più informazione), bonus audio se alto SNR implicito
     conf_base = _clamp(0.15 + 2.3 * spread, 0.10, 0.99)
-    # se compressione pesante/dup alti, tira giù un po'
     conf = conf_base - penalty * 0.4
     conf = int(round(_clamp(conf, 0.10, 0.99) * 100))
 
-    # label
     if fused_avg_pen <= REAL_TH:
         label = "real"
     elif fused_avg_pen >= AI_TH:
@@ -151,16 +137,18 @@ def fuse(video: Dict[str, Any], audio: Dict[str, Any], hints: Dict[str, Any]) ->
     else:
         label = "uncertain"
 
-    # peaks (sui valori fusi)
     peaks = [{"t": i, "ai_score": v} for (i, v) in _local_peaks(fused, min_prom=0.05, min_dist=2, top_k=6)]
 
     reason = _reason_builder(hints, video, audio, fused_avg_pen, spread)
 
     return {
-        "ai_score": round(fused_avg_pen, 6),
-        "label": label,
-        "confidence": conf,
-        "timeline_binned": [{"start": i, "end": i+1, "ai_score": v} for i, v in enumerate(fused)],
+        "result": {
+            "ai_score": round(fused_avg_pen, 6),
+            "label": label,
+            "confidence": conf,
+            "reason": reason
+        },
+        "timeline_binned": [{"start": i, "end": i + 1, "ai_score": v} for i, v in enumerate(fused)],
         "peaks": peaks,
-        "reason": reason
+        "hints": hints or {}
     }
