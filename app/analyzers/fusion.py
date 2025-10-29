@@ -163,3 +163,6 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
         "peaks": peaks,
         "hints": hints or {}
     }
+
+# Added config: peak threshold
+MIN_PEAK_SCORE = float(os.getenv('MIN_PEAK_SCORE', '0.12'))
