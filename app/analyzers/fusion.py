@@ -34,6 +34,7 @@ def _reason_builder(hints: Dict[str, Any], video: Dict[str, Any], audio: Dict[st
     comp = (hints or {}).get("compression")
     if not (video or {}).get("timeline"):
         parts.append("nessun frame video decodificato")
+
     dup_avg = (video.get("summary") or {}).get("dup_avg", 0.0) if video else 0.0
     flow = (hints or {}).get("flow_used", 0.0)
     motion = (hints or {}).get("motion_used", 0.0)
@@ -63,6 +64,9 @@ def _reason_builder(hints: Dict[str, Any], video: Dict[str, Any], audio: Dict[st
         v_avg = _mean([x.get("ai_score", 0.5) for x in v_tl])
         a_avg = _mean([x.get("ai_score", 0.5) for x in a_tl])
         parts.append("segnali audio/video concordi" if abs(v_avg - a_avg) < 0.08 else "segnali misti audio/video")
+
+    if (hints or {}).get("handheld_camera_likely", False):
+        parts.append("handheld iPhone rilevato")
 
     if not parts:
         parts.append("segnali limitati")
@@ -120,33 +124,37 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
     flow_avg = (hints or {}).get("flow_used", 0.0)
     motion_avg = (hints or {}).get("motion_used", 0.0)
 
-    penalty = 0.0
+    # ---- FIX: usare 'adjust' (non 'penalty') e sommare all'output ----
+    adjust = 0.0
+
+    # 1) compressione pesante / bpp basso → spinge verso AI (punteggio su)
     if comp == "heavy" or bpp < 0.06:
-        penalty += 0.06
+        adjust += 0.06
 
-    if dup_avg >= 0.65 and (flow_avg and flow_avg > 1.0 or motion_avg and motion_avg > 22.0):
-        penalty -= 0.04  # riduci spinta verso AI se c'è movimento/flow
+    # 2) molti duplicati ma con flow/motion reale → attenua (punteggio giù)
+    if dup_avg >= 0.65 and ((flow_avg and flow_avg > 1.0) or (motion_avg and motion_avg > 22.0)):
+        adjust -= 0.04
 
+    # 3) prior pro-reale per iPhone handheld con bpp ok, comp normale/bassa e movimento lento/presente
     device = (meta or {}).get("device") or {}
     if (device.get("vendor") == "Apple" or device.get("os") == "iOS") and (hints or {}).get("video_has_signal", False):
-        # prior pro-reale anche in movimento lento (motion >= 5) o flow presente
-        if bpp >= 0.08 and (comp in (None, "normal", "low")) and ((flow_avg and flow_avg > 1.0) or (motion_avg and motion_avg >= 5.0)):
-            penalty -= 0.05  # prima era -0.03
+        if (bpp >= 0.08) and (comp in (None, "normal", "low")) and ((flow_avg and flow_avg > 1.0) or (motion_avg and motion_avg >= 5.0)):
+            adjust -= 0.05  # NEGATIVO => abbassa lo score (pro-reale)
 
-    fused_avg_pen = _clamp(fused_avg - penalty, 0.0, 1.0)
+    fused_avg_adj = _clamp(fused_avg + adjust, 0.0, 1.0)
 
     base_conf = 0.20 + 2.5 * spread
     if comp == "heavy" or not (hints or {}).get("video_has_signal", True):
         base_conf *= 0.7
     conf = int(_clamp(base_conf, 0.10, 0.99) * 100)
 
-    label = _label_from_score(fused_avg_pen)
+    label = _label_from_score(fused_avg_adj)
     peaks = [{"t": i, "ai_score": v} for (i, v) in _local_peaks(fused, min_prom=0.05, min_dist=2, top_k=6)]
-    reason = _reason_builder(hints, video or {}, audio or {}, fused_avg_pen, spread)
+    reason = _reason_builder(hints, video or {}, audio or {}, fused_avg_adj, spread)
 
     return {
         "result": {
-            "ai_score": round(fused_avg_pen, 6),
+            "ai_score": round(fused_avg_adj, 6),
             "label": label,
             "confidence": conf,
             "reason": reason
