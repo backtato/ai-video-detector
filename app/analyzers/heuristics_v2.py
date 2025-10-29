@@ -17,8 +17,8 @@ def compute_hints(video_stats: dict = None, audio_stats: dict = None, meta: dict
     w   = float(_get(v, "width", default=0.0) or 0.0)
     h   = float(_get(v, "height", default=0.0) or 0.0)
     fps = float(_get(v, "src_fps", default=0.0) or _get(m, "fps", default=0.0) or 0.0)
-    denom = (w*h*fps) if (w>0 and h>0 and fps>0) else 1.0
-    bpp = br/denom
+    denom = (w * h * fps) if (w > 0 and h > 0 and fps > 0) else 1.0
+    bpp = br / denom
     hints["bpp"] = round(bpp, 5)
 
     if bpp < 0.03:
