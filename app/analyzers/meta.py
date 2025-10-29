@@ -14,26 +14,23 @@ def _run(cmd: List[str]) -> Tuple[int, str, str]:
         return 1, "", str(e)
 
 def _ffprobe_json(path: str) -> Dict[str, Any]:
-    code, out, _ = _run([
-        "ffprobe", "-v", "error", "-print_format", "json",
-        "-show_format", "-show_streams", path
-    ])
-    if code != 0:
+    rc, out, err = _run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path])
+    if rc != 0:
         return {}
     try:
-        return json.loads(out or "{}")
+        return json.loads(out) if out else {}
     except Exception:
         return {}
 
-def _exiftool_json(path: str) -> List[Dict[str, Any]]:
-    code, out, _ = _run(["exiftool", "-j", "-struct", "-G", "-n", path])
-    if code != 0:
-        return []
+def _exiftool_json(path: str) -> Dict[str, Any]:
+    rc, out, err = _run(["exiftool", "-json", "-struct", "-G1", path])
+    if rc != 0:
+        return {}
     try:
         data = json.loads(out or "[]")
-        return data if isinstance(data, list) else []
+        return data[0] if isinstance(data, list) and data else {}
     except Exception:
-        return []
+        return {}
 
 def detect_device(path: str) -> Dict[str, Any]:
     """
@@ -52,7 +49,7 @@ def detect_device(path: str) -> Dict[str, Any]:
     streams  = ffj.get("streams", []) or []
     vtags = next((s.get("tags", {}) for s in streams if s.get("codec_type") == "video"), {})
     atags = next((s.get("tags", {}) for s in streams if s.get("codec_type") == "audio"), {})
-    pool = [fmt_tags, vtags or {}, atags or {}]
+    pool = [fmt_tags or {}, vtags or {}, atags or {}]
 
     def _get(*names: str) -> Optional[str]:
         for d in pool:
@@ -85,7 +82,7 @@ def detect_device(path: str) -> Dict[str, Any]:
 def detect_c2pa(path: str) -> Dict[str, Any]:
     """
     Ritorna: {"present": bool, "note": str}
-    Heuristica veloce: cerca parole chiave C2PA/JUMBF/Content Credentials negli XMP (exiftool).
+    Heuristica veloce: cerca parole chiave C2PA/JUMBF/Content Credentials nell'XMP letto da exiftool.
     Se exiftool non è presente → present=False con nota.
     """
     probe = _exiftool_json(path)
@@ -93,7 +90,10 @@ def detect_c2pa(path: str) -> Dict[str, Any]:
     note = ""
 
     if probe:
-        text = json.dumps(probe, ensure_ascii=False).lower()
+        try:
+            text = json.dumps(probe, ensure_ascii=False).lower()
+        except Exception:
+            text = ""
         if any(k in text for k in ['"c2pa"', "content credentials", "jumbf", "manifest"]):
             present = True
             note = "Possibile C2PA/JUMBF nei metadati XMP"
