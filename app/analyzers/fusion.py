@@ -20,7 +20,6 @@ def _local_peaks(xs: List[float], min_prom: float = 0.05, min_dist: int = 2, top
     n = len(xs)
     for i in range(1, n - 1):
         if xs[i] > xs[i - 1] and xs[i] > xs[i + 1]:
-            # prominence grezza
             left_min = min(xs[max(0, i - min_dist):i]) if i - min_dist >= 0 else xs[i - 1]
             right_min = min(xs[i + 1:min(n, i + 1 + min_dist)]) if i + 1 + min_dist <= n else xs[i + 1]
             prom = xs[i] - max(left_min, right_min)
@@ -33,7 +32,7 @@ def _reason_builder(hints: Dict[str, Any], video: Dict[str, Any], audio: Dict[st
                     fused: float, spread: float) -> str:
     parts = []
     comp = (hints or {}).get("compression")
-    if video is None or not video.get("timeline"):
+    if not (video or {}).get("timeline"):
         parts.append("nessun frame video decodificato")
     dup_avg = (video.get("summary") or {}).get("dup_avg", 0.0) if video else 0.0
     flow = (hints or {}).get("flow_used", 0.0)
@@ -43,6 +42,8 @@ def _reason_builder(hints: Dict[str, Any], video: Dict[str, Any], audio: Dict[st
         parts.append("compressione pesante")
     elif comp == "normal":
         parts.append("compressione normale")
+    elif comp == "low":
+        parts.append("compressione bassa")
 
     if dup_avg >= 0.65:
         if flow and flow > 1.0:
@@ -50,28 +51,21 @@ def _reason_builder(hints: Dict[str, Any], video: Dict[str, Any], audio: Dict[st
         else:
             parts.append("molti frame duplicati")
 
-    # musica/silenzio flags (se presenti in audio.flags_audio)
     flags = (audio or {}).get("flags_audio") or []
     if "likely_music" in flags:
         parts.append("audio con musica/ambiente")
     if "low_voice_presence" in flags:
         parts.append("voce scarsa/assente")
 
-    # coerenza tra canali
-    v_last = (video or {}).get("timeline_ai") or []
-    a_last = (audio or {}).get("timeline") or []
-    if v_last and a_last:
-        # confronto grossolano su medie
-        v_avg = _mean([x.get("ai_score", 0.5) for x in v_last])
-        a_avg = _mean([x.get("ai_score", 0.5) for x in a_last])
-        if abs(v_avg - a_avg) < 0.08:
-            parts.append("segnali audio/video concordi")
-        else:
-            parts.append("segnali misti audio/video")
+    v_tl = (video or {}).get("timeline_ai") or []
+    a_tl = (audio or {}).get("timeline") or []
+    if v_tl and a_tl:
+        v_avg = _mean([x.get("ai_score", 0.5) for x in v_tl])
+        a_avg = _mean([x.get("ai_score", 0.5) for x in a_tl])
+        parts.append("segnali audio/video concordi" if abs(v_avg - a_avg) < 0.08 else "segnali misti audio/video")
 
     if not parts:
         parts.append("segnali limitati")
-
     return " ; ".join(parts)
 
 def _label_from_score(s: float) -> str:
@@ -82,11 +76,6 @@ def _label_from_score(s: float) -> str:
     return "uncertain"
 
 def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], audio: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Fusione conservativa audio+video con clamp neutro per casi senza video,
-    attenuazione 'dup' quando c'è motion/flow, e prior leggero per handheld iOS.
-    """
-    # --- timelines per secondo (già clampate a durata in api) ---
     v_tl = (video or {}).get("timeline_ai") or []
     a_tl = (audio or {}).get("timeline") or []
 
@@ -94,7 +83,6 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
     if T == 0:
         T = max((video or {}).get("frames_sampled", 0), (audio or {}).get("frames_sampled", 0))
     if T == 0:
-        # fallback duro: niente segnali → neutro
         fused = [0.5]
     else:
         def _get(lst: List[Dict[str, float]], i: int) -> float:
@@ -102,21 +90,18 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
                 return float(lst[i].get("ai_score", 0.5))
             return 0.5
 
-        # default pesi (più bilanciati)
         w_audio = 0.45
         w_video = 0.45
-        boost = 0.10  # piccolo boost quando concordano
+        boost = 0.10
 
-        # Caso speciale: nessun video decodificato → neutro forte
         no_video = (not v_tl) or not (hints or {}).get("video_has_signal", False)
         if no_video:
             w_audio = 0.25
             w_video = 0.25
-            neutral = 0.5
             fused = []
             for i in range(T):
                 aa = _get(a_tl, i)
-                fx = 0.5 + (aa - 0.5) * 0.30  # clamp debole attorno a 0.5
+                fx = 0.5 + (aa - 0.5) * 0.30
                 fused.append(_clamp(fx, 0.45, 0.55))
         else:
             fused = []
@@ -129,7 +114,6 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
     fused_avg = _mean(fused)
     spread = _stdev(fused)
 
-    # --- penalità/bonus da hints ---
     bpp = (hints or {}).get("bpp") or 0.0
     comp = (hints or {}).get("compression")
     dup_avg = (video.get("summary") or {}).get("dup_avg", 0.0) if video else 0.0
@@ -139,22 +123,17 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
     penalty = 0.0
     if comp == "heavy" or bpp < 0.06:
         penalty += 0.06
-    elif comp == "normal":
-        penalty += 0.00
 
-    # Attenua l'impatto dei duplicati se c'è movimento/flow
     if dup_avg >= 0.65 and (flow_avg and flow_avg > 1.0 or motion_avg and motion_avg > 22.0):
-        penalty -= 0.04  # riduci spinta verso AI
+        penalty -= 0.04  # riduci spinta verso AI se c'è movimento/flow
 
-    # Prior handheld iOS/Apple quando qualità ok
     device = (meta or {}).get("device") or {}
     if (device.get("vendor") == "Apple" or device.get("os") == "iOS") and (hints or {}).get("video_has_signal", False):
-        if bpp >= 0.08 and (comp in (None, "normal")) and (flow_avg and flow_avg > 1.0):
-            penalty -= 0.03  # piccolo bias pro-reale
+        if bpp >= 0.08 and (comp in (None, "normal", "low")) and (flow_avg and flow_avg > 1.0):
+            penalty -= 0.03  # micro-prior pro-reale
 
     fused_avg_pen = _clamp(fused_avg - penalty, 0.0, 1.0)
 
-    # confidenza basata su spread + qualità
     base_conf = 0.20 + 2.5 * spread
     if comp == "heavy" or not (hints or {}).get("video_has_signal", True):
         base_conf *= 0.7
