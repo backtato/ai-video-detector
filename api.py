@@ -11,7 +11,12 @@ from fastapi.responses import JSONResponse
 import numpy as np
 import soundfile as sf
 import cv2
-
+try:
+    cv2.setNumThreads(1)
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
+    
 from app.analyzers import audio as audio_an
 from app.analyzers import video as video_an
 from app.analyzers import forensic as forensic_an
