@@ -67,10 +67,7 @@ def _reason_builder(hints: Dict[str, Any], video: Dict[str, Any], audio: Dict[st
     v_avg = _mean_from_series(video.get("timeline_ai", []))
     a_avg = _mean_from_series(audio.get("timeline", []))
     dv = abs(v_avg - a_avg)
-    if dv < 0.07:
-        parts.append("segnali audio/video concordi")
-    else:
-        parts.append("segnali misti audio/video")
+    parts.append("segnali audio/video concordi" if dv < 0.07 else "segnali misti audio/video")
 
     if spread < 0.04:
         parts.append("variazioni minime nel tempo")
@@ -126,7 +123,8 @@ def fuse(video: Dict[str, Any], audio: Dict[str, Any], hints: Dict[str, Any]) ->
 
     fused_avg_pen = _clamp(fused_avg - 0.5 * penalty, 0.0, 1.0)
 
-    conf_base = _clamp(0.15 + 2.3 * spread, 0.10, 0.99)
+    # 🔧 leggero rialzo baseline confidenza per dare più dinamica quando c'è spread
+    conf_base = _clamp(0.20 + 2.5 * spread, 0.10, 0.99)
     conf = conf_base - penalty * 0.4
     conf = int(round(_clamp(conf, 0.10, 0.99) * 100))
 
