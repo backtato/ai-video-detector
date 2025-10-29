@@ -1,6 +1,6 @@
 from typing import Dict, Any, List, Tuple
 
-REAL_TH = 0.35
+REAL_TH = 0.40   # soglia più "real-friendly"
 AI_TH   = 0.72
 
 def _clamp(v, lo, hi):
@@ -129,8 +129,9 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
 
     device = (meta or {}).get("device") or {}
     if (device.get("vendor") == "Apple" or device.get("os") == "iOS") and (hints or {}).get("video_has_signal", False):
-        if bpp >= 0.08 and (comp in (None, "normal", "low")) and (flow_avg and flow_avg > 1.0):
-            penalty -= 0.03  # micro-prior pro-reale
+        # prior pro-reale anche in movimento lento (motion >= 5) o flow presente
+        if bpp >= 0.08 and (comp in (None, "normal", "low")) and ((flow_avg and flow_avg > 1.0) or (motion_avg and motion_avg >= 5.0)):
+            penalty -= 0.05  # prima era -0.03
 
     fused_avg_pen = _clamp(fused_avg - penalty, 0.0, 1.0)
 
