@@ -167,3 +167,5 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
 
 # Added config: peak threshold
 MIN_PEAK_SCORE = float(os.getenv('MIN_PEAK_SCORE', '0.12'))
+# Soglia configurabile per picchi (stabilizza "peaks" su compressioni alte)
+MIN_PEAK_SCORE = float(os.getenv("MIN_PEAK_SCORE", "0.12"))
