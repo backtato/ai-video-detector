@@ -312,3 +312,84 @@ async def cors_test():
 async def options_preflight(path: str):
     from fastapi.responses import Response
     return Response(status_code=204)
+    # === Lightweight health/CORS endpoints + lazy import + handlers ===
+from fastapi.responses import JSONResponse
+import importlib
+
+# /healthz super-leggero (per Render)
+@app.get("/healthz", response_class=JSONResponse)
+def healthz():
+    return {"ok": True}
+
+# /readyz (diagnostico, NON usato da Render)
+from functools import lru_cache
+from time import perf_counter
+import shutil as _shutil
+
+@lru_cache(maxsize=1)
+def _ready_probe():
+    t0 = perf_counter()
+    return {
+        "ffprobe_found": _shutil.which("ffprobe") is not None,
+        "exiftool_found": _shutil.which("exiftool") is not None,
+        "elapsed_ms": int((perf_counter()-t0)*1000),
+    }
+
+@app.get("/readyz", response_class=JSONResponse)
+def readyz():
+    return {"ok": True, **_ready_probe()}
+
+# Banner root (facoltativo, utile)
+@app.get("/", response_class=JSONResponse)
+def root():
+    return {"ok": True, "service": "ai-video-detector", "version": globals().get("VERSION", "unknown")}
+
+# Preflight universale (CORS)
+@app.options("/{path:path}")
+async def options_preflight(path: str):
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
+# CORS quick test dal frontend
+@app.post("/cors-test", response_class=JSONResponse)
+async def cors_test():
+    return {"ok": True, "message": "CORS OK"}
+
+# Lazy import per librerie pesanti (evita cold-start lenti)
+_IMPORT_CACHE = {}
+def _lazy_import(name: str):
+    mod = _IMPORT_CACHE.get(name)
+    if mod is None:
+        mod = importlib.import_module(name)
+        _IMPORT_CACHE[name] = mod
+    return mod
+
+# Helper opzionali (usali nel codice dove richiesto: _np(), _sf(), _cv2())
+def _np():
+    return _lazy_import("numpy")
+
+def _sf():
+    return _lazy_import("soundfile")
+
+def _cv2():
+    return _lazy_import("cv2")
+
+# Handlers JSON puliti (422/HTTPException)
+from fastapi import HTTPException
+from fastapi.exceptions import RequestValidationError
+from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Invalid request", "errors": str(exc)}
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail if isinstance(exc.detail, (str, dict)) else str(exc)}
+    )
+    
