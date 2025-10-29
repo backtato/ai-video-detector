@@ -2,20 +2,20 @@ services:
   - type: web
     name: ai-video-detector
     env: docker
-    plan: free
+    plan: standard         # <— da "free" a "standard" (istanza a pagamento)
     healthCheckPath: /healthz
-    autoDeploy: true
+    autoDeploy: false      # <— disattiva auto-deploy per NON consumare pipeline minutes
     envVars:
       - key: ALLOWED_ORIGINS
-        sync: false
-      # In alternativa alla lista, puoi usare una regex:
+        value: "https://www.greensovereignfund.ch"
+      # In alternativa:
       # - key: ALLOWED_ORIGIN_REGEX
       #   value: "^https://(www\\.)?greensovereignfund\\.ch$"
 
-      - key: MAX_UPLOAD_BYTES          # CHANGED
-        value: "104857600"             # 100 MB
+      - key: MAX_UPLOAD_BYTES
+        value: "104857600"        # 100 MB
       - key: RESOLVER_MAX_BYTES
-        value: "125829120"
+        value: "125829120"        # 120 MB
       - key: REQUEST_TIMEOUT_S
         value: "120"
       - key: USE_YTDLP
