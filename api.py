@@ -186,12 +186,17 @@ def _analyze_file(path: str) -> Dict[str, Any]:
         "timeline": _clamp_tl(audio.get("timeline") or [])
     }
 
+    # ---- DEVICE: unwrap se il detector ritorna {"device": {...}} ----
+    dev = meta_an.detect_device(path) if hasattr(meta_an, "detect_device") else {"vendor": None, "model": None, "os": None}
+    if isinstance(dev, dict) and "device" in dev and isinstance(dev["device"], dict):
+        dev = dev["device"]
+
     meta_out = {
         "width": basic["width"], "height": basic["height"], "fps": basic["fps"], "duration": basic["duration"],
         "bit_rate": basic["bit_rate"], "vcodec": basic["vcodec"], "acodec": basic["acodec"], "format_name": basic["format_name"],
         "source_url": None, "resolved_url": None,
         "forensic": {"c2pa": {"present": False}},
-        "device": meta_an.detect_device(path) if hasattr(meta_an, "detect_device") else {"vendor": None, "model": None, "os": None}
+        "device": dev
     }
 
     hints["flow_used"] = float(v_summary.get("optflow_mag_avg") or 0.0)
