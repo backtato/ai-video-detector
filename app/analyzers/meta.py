@@ -83,7 +83,7 @@ def detect_c2pa(path: str) -> Dict[str, Any]:
     """
     Ritorna: {"present": bool, "note": str}
     Heuristica veloce: cerca parole chiave C2PA/JUMBF/Content Credentials nell'XMP letto da exiftool.
-    Se exiftool non è presente → present=False con nota.
+    Se exiftool non Ã¨ presente â present=False con nota.
     """
     probe = _exiftool_json(path)
     present = False
