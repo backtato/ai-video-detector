@@ -4,13 +4,12 @@ import json
 import tempfile
 import subprocess
 import asyncio
-import logging
 import traceback
 from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 
 from app.analyzers import audio as audio_an
 from app.analyzers import video as video_an
@@ -18,7 +17,7 @@ from app.analyzers import fusion as fusion_an
 from app.analyzers import heuristics_v2 as hx
 from app.analyzers import meta as meta_an
 
-VERSION = os.getenv("VERSION", "1.2.2")
+VERSION = os.getenv("VERSION", "1.2.3")
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 RESOLVER_MAX_BYTES = int(os.getenv("RESOLVER_MAX_BYTES", str(120 * 1024 * 1024)))
@@ -117,7 +116,6 @@ def _ready_probe() -> Dict[str, Any]:
     }
 
 async def _safe_audio(path: str, meta: dict) -> tuple[dict, dict]:
-    """Esegue l'analisi audio con gestione errori: in caso di failure ritorna timeline neutrale e hint."""
     hints_extra = {}
     try:
         return await asyncio.wait_for(asyncio.to_thread(audio_an.analyze, path, meta), timeout=REQUEST_TIMEOUT_S), hints_extra
@@ -130,7 +128,6 @@ async def _safe_audio(path: str, meta: dict) -> tuple[dict, dict]:
         return neutral, hints_extra
 
 async def _safe_video(path: str, meta: dict) -> tuple[dict, dict]:
-    """Esegue l'analisi video con gestione errori: in caso di failure ritorna timeline neutrale e hint."""
     hints_extra = {}
     try:
         return await asyncio.wait_for(asyncio.to_thread(video_an.analyze, path, meta), timeout=REQUEST_TIMEOUT_S), hints_extra
@@ -145,7 +142,6 @@ async def _safe_video(path: str, meta: dict) -> tuple[dict, dict]:
 async def _analyze_path(path: str, source_url: Optional[str]=None, resolved_url: Optional[str]=None) -> Dict[str, Any]:
     meta = _probe_basic_meta(path)
     hints = hx.compute_hints(meta, path)
-    # Run audio/video safely (no crash → neutral fallback)
     audio, a_hint = await _safe_audio(path, meta)
     video, v_hint = await _safe_video(path, meta)
     hints.update(a_hint); hints.update(v_hint)
@@ -164,7 +160,6 @@ async def _analyze_path(path: str, source_url: Optional[str]=None, resolved_url:
         "timeline_binned": fused["timeline_binned"],
         "peaks": fused["peaks"],
     }
-    # Forensic/meta extras
     try:
         forensic = meta_an.forensic_summary(path)
         if forensic:
