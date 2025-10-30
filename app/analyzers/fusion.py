@@ -1,165 +1,84 @@
 import os
-from typing import Dict, Any, List, Tuple
+import numpy as np
 
-REAL_TH = 0.35   # allineato alla UI conservativa
-AI_TH   = 0.72
-MIN_PEAK_SCORE = float(os.getenv("MIN_PEAK_SCORE", "0.12"))
+THRESH_REAL_MAX = float(os.getenv("THRESH_REAL_MAX", "0.35"))
+THRESH_AI_MIN = float(os.getenv("THRESH_AI_MIN", "0.72"))
 
-def _clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+def _bin_timeline(ts):
+    if not ts: return []
+    # smooth with simple moving average (window=3)
+    arr = np.array(ts, dtype=float)
+    if len(arr)>=3:
+        ker = np.ones(3)/3.0
+        arr = np.convolve(arr, ker, mode="same")
+    # bin per second already
+    return np.clip(arr,0.0,1.0).tolist()
 
-def _mean(xs: List[float]) -> float:
-    return sum(xs) / max(1, len(xs))
+def fuse(audio: dict, video: dict, hints: dict):
+    # audio timeline proxy: use audio.timeline if present, else neutral 0.5
+    a_t = audio.get("timeline") or []
+    v_t = video.get("timeline") or video.get("timeline_ai") or []
 
-def _stdev(xs: List[float]) -> float:
-    if len(xs) < 2:
-        return 0.0
-    m = _mean(xs)
-    return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
+    L = max(len(a_t), len(v_t), 1)
+    if len(a_t)<L: a_t += [a_t[-1] if a_t else 0.5]*(L-len(a_t))
+    if len(v_t)<L: v_t += [v_t[-1] if v_t else 0.5]*(L-len(v_t))
 
-def _local_peaks(xs: List[float], min_prom: float = None, min_dist: int = 2, top_k: int = 6) -> List[Tuple[int, float]]:
-    # usa MIN_PEAK_SCORE come minimo, ma non scendere sotto 0.05
-    if min_prom is None:
-        min_prom = max(0.05, MIN_PEAK_SCORE)
-    peaks = []
-    n = len(xs)
-    for i in range(1, n - 1):
-        if xs[i] > xs[i - 1] and xs[i] > xs[i + 1]:
-            left_min = min(xs[max(0, i - min_dist):i]) if i - min_dist >= 0 else xs[i - 1]
-            right_min = min(xs[i + 1:min(n, i + 1 + min_dist)]) if i + 1 + min_dist <= n else xs[i + 1]
-            prom = xs[i] - max(left_min, right_min)
-            if prom >= min_prom:
-                peaks.append((i, xs[i]))
-    peaks.sort(key=lambda t: t[1], reverse=True)
-    return peaks[:top_k]
+    a = np.array(a_t, dtype=float)
+    v = np.array(v_t, dtype=float)
 
-def _reason_builder(hints: Dict[str, Any], video: Dict[str, Any], audio: Dict[str, Any],
-                    fused: float, spread: float) -> str:
-    parts = []
-    comp = (hints or {}).get("compression")
-    if not (video or {}).get("timeline"):
-        parts.append("nessun frame video decodificato")
+    # base weights (conservative)
+    w_audio = 0.65
+    w_video = 0.25
+    bonus_agree = 0.10 if np.sign(np.mean(a)-0.5) == np.sign(np.mean(v)-0.5) else 0.0
 
-    dup_avg = (video.get("summary") or {}).get("dup_avg", 0.0) if video else 0.0
-    flow = (hints or {}).get("flow_used", 0.0)
-    motion = (hints or {}).get("motion_used", 0.0)
+    # penalties/bonuses from hints
+    comp = hints.get("compression","normal")
+    bpp = hints.get("bpp", 0.0)
+    dup = hints.get("dup_avg", 0.0)
+    penalties = 0.0
+    if comp in ("heavy","very_heavy"): penalties += 0.05
+    if bpp < 0.07: penalties += 0.05
+    if dup > 0.2: penalties += 0.05
 
-    if comp == "heavy":
-        parts.append("compressione pesante")
-    elif comp == "normal":
-        parts.append("compressione normale")
-    elif comp == "low":
-        parts.append("compressione bassa")
+    # combine
+    timeline = (w_audio*a + w_video*v + bonus_agree*(a+v)/2.0) - penalties
+    timeline = np.clip(timeline, 0.0, 1.0)
 
-    if dup_avg >= 0.65:
-        if flow and flow > 1.0:
-            parts.append("molti frame simili ma con micro-movimenti reali")
-        else:
-            parts.append("molti frame duplicati")
+    # peaks (exclude near-0.5)
+    peaks = [i for i,x in enumerate(timeline.tolist()) if x<=0.25 or x>=0.75]
 
-    flags = (audio or {}).get("flags_audio") or []
-    if "likely_music" in flags:
-        parts.append("audio con musica/ambiente")
-    if "low_voice_presence" in flags:
-        parts.append("voce scarsa/assente")
+    # final score as mean
+    score = float(np.mean(timeline))
+    # confidence from spread
+    spread = float(np.std(timeline))
+    conf = float(np.clip(0.20 + 2.5*spread - penalties, 0.10, 0.99))
 
-    v_tl = (video or {}).get("timeline_ai") or []
-    a_tl = (audio or {}).get("timeline") or []
-    if v_tl and a_tl:
-        v_avg = _mean([x.get("ai_score", 0.5) for x in v_tl])
-        a_avg = _mean([x.get("ai_score", 0.5) for x in a_tl])
-        parts.append("segnali audio/video concordi" if abs(v_avg - a_avg) < 0.08 else "segnali misti audio/video")
-
-    if (hints or {}).get("handheld_camera_likely", False):
-        parts.append("handheld iPhone rilevato")
-
-    if not parts:
-        parts.append("segnali limitati")
-    return " ; ".join(parts)
-
-def _label_from_score(s: float) -> str:
-    if s <= REAL_TH:
-        return "real"
-    if s >= AI_TH:
-        return "ai"
-    return "uncertain"
-
-def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], audio: Dict[str, Any]) -> Dict[str, Any]:
-    v_tl = (video or {}).get("timeline_ai") or []
-    a_tl = (audio or {}).get("timeline") or []
-
-    T = max(len(v_tl), len(a_tl))
-    if T == 0:
-        T = max((video or {}).get("frames_sampled", 0), (audio or {}).get("frames_sampled", 0))
-    if T == 0:
-        fused = [0.5]
+    if score <= THRESH_REAL_MAX:
+        label = "real"
+        reason = []
+        if dup>0.25: reason.append("molti frame duplicati")
+        if comp in ("heavy","very_heavy"): reason.append("compressione pesante")
+        if not reason: reason.append("segnali audio/video coerenti con ripresa reale")
+        reason = "; ".join(reason)
+    elif score >= THRESH_AI_MIN:
+        label = "ai"
+        reason = []
+        if audio.get("scores",{}).get("tts_like",0)>0.6: reason.append("audio TTS-like elevato")
+        if dup>0.2: reason.append("molti frame duplicati")
+        if hints.get("video_has_signal", True) is False: reason.append("segnali video deboli")
+        if not reason: reason = ["pattern e indizi coerenti con generazione AI"]
+        reason = "; ".join(reason)
     else:
-        def _get(lst: List[Dict[str, float]], i: int) -> float:
-            if i < len(lst):
-                return float(lst[i].get("ai_score", 0.5))
-            return 0.5
-
-        w_audio = 0.45
-        w_video = 0.45
-        boost = 0.10
-
-        no_video = (not v_tl) or not (hints or {}).get("video_has_signal", False)
-        if no_video:
-            w_audio = 0.25
-            w_video = 0.25
-            fused = []
-            for i in range(T):
-                aa = _get(a_tl, i)
-                fx = 0.5 + (aa - 0.5) * 0.30
-                fused.append(_clamp(fx, 0.45, 0.55))
-        else:
-            fused = []
-            for i in range(T):
-                aa = _get(a_tl, i)
-                va = _get(v_tl, i)
-                fx = w_audio * aa + w_video * va + boost * ((va + aa) / 2 - 0.5)
-                fused.append(_clamp(fx, 0.0, 1.0))
-
-    fused_avg = _mean(fused)
-    spread = _stdev(fused)
-
-    bpp = (hints or {}).get("bpp") or 0.0
-    comp = (hints or {}).get("compression")
-    dup_avg = (video.get("summary") or {}).get("dup_avg", 0.0) if video else 0.0
-    flow_avg = (hints or {}).get("flow_used", 0.0)
-    motion_avg = (hints or {}).get("motion_used", 0.0)
-
-    # Aggiustamenti conservativi
-    adjust = 0.0
-    if comp == "heavy" or bpp < 0.06:
-        adjust += 0.06
-    if dup_avg >= 0.65 and ((flow_avg and flow_avg > 1.0) or (motion_avg and motion_avg > 22.0)):
-        adjust -= 0.04
-
-    device = (meta or {}).get("device") or {}
-    if (device.get("vendor") == "Apple" or device.get("os") == "iOS") and (hints or {}).get("video_has_signal", False):
-        if (bpp >= 0.08) and (comp in (None, "normal", "low")) and ((flow_avg and flow_avg > 1.0) or (motion_avg and motion_avg >= 5.0)):
-            adjust -= 0.05  # piÃ¹ favore al "real"
-
-    fused_avg_adj = _clamp(fused_avg + adjust, 0.0, 1.0)
-
-    base_conf = 0.20 + 2.5 * spread
-    if comp == "heavy" or not (hints or {}).get("video_has_signal", True):
-        base_conf *= 0.7
-    conf = int(_clamp(base_conf, 0.10, 0.99) * 100)
-
-    label = _label_from_score(fused_avg_adj)
-    peaks = [{"t": i, "ai_score": v} for (i, v) in _local_peaks(fused, min_prom=None, min_dist=2, top_k=6)]
-    reason = _reason_builder(hints, video or {}, audio or {}, fused_avg_adj, spread)
+        label = "uncertain"
+        reason = "segnali misti o neutri"
 
     return {
         "result": {
-            "ai_score": round(fused_avg_adj, 6),
             "label": label,
-            "confidence": conf,
+            "ai_score": round(score, 2),
+            "confidence": round(conf, 2),
             "reason": reason
         },
-        "timeline_binned": [{"start": i, "end": i + 1, "ai_score": v} for i, v in enumerate(fused)],
+        "timeline_binned": _bin_timeline(timeline.tolist()),
         "peaks": peaks,
-        "hints": hints or {}
     }
