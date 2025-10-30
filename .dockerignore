@@ -1,4 +1,3 @@
-# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -6,19 +5,16 @@ __pycache__/
 *.log
 *.sqlite3
 
-# VCS
 .git
 .gitignore
 .gitattributes
 
-# Env / IDE
 .env
 .venv
 *.code-workspace
 .vscode/
 .idea/
 
-# Build / cache
 dist/
 build/
 *.egg-info/
@@ -26,6 +22,5 @@ build/
 .cache/
 .pytest_cache/
 
-# OS
 .DS_Store
 Thumbs.db
