@@ -1,9 +1,6 @@
 # app/analyzers/meta.py
-# Rilevamento "device" e presenza C2PA dai metadati. Zero dipendenze interne.
-
 from __future__ import annotations
-import subprocess
-import json
+import subprocess, json
 from typing import Dict, Any, Optional, List, Tuple
 
 def _run(cmd: List[str]) -> Tuple[int, str, str]:
@@ -14,36 +11,20 @@ def _run(cmd: List[str]) -> Tuple[int, str, str]:
         return 1, "", str(e)
 
 def _ffprobe_json(path: str) -> Dict[str, Any]:
-    rc, out, err = _run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path])
+    rc, out, err = _run(["ffprobe", "-hide_banner", "-v", "error",
+                         "-print_format", "json", "-show_format", "-show_streams", path])
     if rc != 0:
         return {}
     try:
-        return json.loads(out) if out else {}
-    except Exception:
-        return {}
-
-def _exiftool_json(path: str) -> Dict[str, Any]:
-    rc, out, err = _run(["exiftool", "-json", "-struct", "-G1", path])
-    if rc != 0:
-        return {}
-    try:
-        data = json.loads(out or "[]")
-        return data[0] if isinstance(data, list) and data else {}
+        return json.loads(out)
     except Exception:
         return {}
 
 def detect_device(path: str) -> Dict[str, Any]:
-    """
-    Ritorna: {"device": {"vendor": str|None, "model": str|None, "os": "iOS|Android|Unknown"}}
-    Heuristics:
-      - tag QuickTime: com.apple.quicktime.make/model => iOS
-      - 'handler_name'/'encoder' contenenti iPhone/iPad/Apple => iOS
-      - indizi Android (sm-, samsung, xiaomi, pixel, oneplus) => Android (debole)
-    """
     ffj = _ffprobe_json(path)
     vendor = None
     model  = None
-    os_name = "Unknown"
+    os_name = None
 
     fmt_tags = (ffj.get("format", {}) or {}).get("tags", {}) or {}
     streams  = ffj.get("streams", []) or []
@@ -58,46 +39,18 @@ def detect_device(path: str) -> Dict[str, Any]:
                     return str(d[n])
         return None
 
-    apple_make  = _get("com.apple.quicktime.make", "Make")
-    apple_model = _get("com.apple.quicktime.model", "Model")
-    handler     = _get("handler_name", "handler", "major_brand") or ""
-    encoder     = _get("encoder", "com.apple.quicktime.software") or ""
-    blob = (handler + " " + encoder).lower()
+    md = _get("com.apple.quicktime.model", "model", "com.apple.quicktime.make")
+    mk = _get("make", "com.apple.quicktime.make")
+    sw = _get("software", "encoder", "com.apple.quicktime.software")
+    an_mk = _get("com.android.manufacturer", "android.manufacturer", "manufacturer")
+    an_md = _get("com.android.model", "android.model")
 
-    if apple_make or apple_model:
-        vendor = apple_make or "Apple"
-        model  = apple_model
+    vendor = mk or an_mk
+    model  = md or an_md
+
+    if sw and "iphone" in (sw.lower()):
         os_name = "iOS"
-    elif any(k in blob for k in ["iphone", "ipad", "apple"]):
-        vendor = "Apple"
-        model  = "iPhone/iPad?"
-        os_name = "iOS"
-    elif any(k in blob for k in ["android", "sm-", "samsung", "xiaomi", "oneplus", "redmi", "pixel"]):
-        vendor = "Android?"
-        model  = None
+    elif vendor and any(x in vendor.lower() for x in ["samsung","xiaomi","huawei","google"]):
         os_name = "Android"
 
     return {"device": {"vendor": vendor, "model": model, "os": os_name}}
-
-def detect_c2pa(path: str) -> Dict[str, Any]:
-    """
-    Ritorna: {"present": bool, "note": str}
-    Heuristica veloce: cerca parole chiave C2PA/JUMBF/Content Credentials nell'XMP letto da exiftool.
-    Se exiftool non Ã¨ presente â present=False con nota.
-    """
-    probe = _exiftool_json(path)
-    present = False
-    note = ""
-
-    if probe:
-        try:
-            text = json.dumps(probe, ensure_ascii=False).lower()
-        except Exception:
-            text = ""
-        if any(k in text for k in ['"c2pa"', "content credentials", "jumbf", "manifest"]):
-            present = True
-            note = "Possibile C2PA/JUMBF nei metadati XMP"
-    else:
-        note = "ExifTool non disponibile o nessun XMP letto"
-
-    return {"present": present, "note": note}

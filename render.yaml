@@ -2,25 +2,15 @@ services:
   - type: web
     name: ai-video-detector
     env: docker
-    plan: standard         # <— da "free" a "standard" (istanza a pagamento)
+    plan: starter
     healthCheckPath: /healthz
-    autoDeploy: false      # <— disattiva auto-deploy per NON consumare pipeline minutes
+    autoDeploy: true
     envVars:
       - key: ALLOWED_ORIGINS
-        value: "https://www.greensovereignfund.ch"
-      # In alternativa:
-      # - key: ALLOWED_ORIGIN_REGEX
-      #   value: "^https://(www\\.)?greensovereignfund\\.ch$"
-
+        value: "*"
       - key: MAX_UPLOAD_BYTES
-        value: "104857600"        # 100 MB
-      - key: RESOLVER_MAX_BYTES
-        value: "125829120"        # 120 MB
+        value: "52428800"
       - key: REQUEST_TIMEOUT_S
-        value: "120"
+        value: "240"
       - key: USE_YTDLP
-        value: "1"
-      - key: RESOLVER_UA
-        value: "Mozilla/5.0 (AVD/1.0; +https://www.aurora-noor.com)"
-      - key: YTDLP_OPTS
-        value: '{"noplaylist":true,"continuedl":false,"retries":1}'
+        value: "0"
