@@ -1,22 +1,36 @@
-import os, json, tempfile, subprocess, asyncio, signal, math
-from typing import Dict, Any, Optional
+import os
+import json
+import tempfile
+import subprocess
+import asyncio
+import logging
+import traceback
+from typing import Dict, Any
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 
+# Analyzer locali
 from app.analyzers import audio as audio_an
 from app.analyzers import video as video_an
-from app.analyzers import forensic as forensic_an
+from app.analyzers import forensic as forensic_an  # lasciato per compatibilità futura
 from app.analyzers import meta as meta_an
 from app.analyzers import fusion as fusion_an
 from app.analyzers import heuristics_v2 as heur_an
 
+# ----- Config -----
 VERSION = os.getenv("SERVICE_VERSION", "1.2.2")
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 REQUEST_TIMEOUT_S = int(os.getenv("REQUEST_TIMEOUT_S", "240"))
-USE_YTDLP = os.getenv("USE_YTDLP", "0") == "1"
 
+# Toggle verbose error responses. When DEBUG is true the API will include stack traces
+# in error responses to aid debugging. In production, DEBUG should be set to 0/false.
+DEBUG = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes")
+
+# ----- App & CORS -----
 app = FastAPI()
+
 allow_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -26,112 +40,200 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def run_cmd(cmd, timeout_s=30, cwd=None, env=None):
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, cwd=cwd, env=env)
+# ----- Utils -----
+def _run_ffprobe(path: str) -> Dict[str, Any]:
+    cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path]
     try:
-        out, err = p.communicate(timeout=timeout_s)
-        return p.returncode, out, err
-    except subprocess.TimeoutExpired:
-        try: os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        except Exception: pass
-        return 124, "", f"Timed out after {timeout_s}s"
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=30)
+        return json.loads(out.decode("utf-8", errors="ignore"))
+    except Exception:
+        return {}
 
-def ffprobe_json(path: str) -> Dict[str, Any]:
-    rc, out, err = run_cmd(["ffprobe", "-hide_banner", "-v", "error",
-                            "-print_format", "json", "-show_streams", "-show_format", path], timeout_s=15)
-    if rc != 0: return {}
-    try: return json.loads(out)
-    except Exception: return {}
-
-def basic_meta(j: Dict[str, Any]) -> Dict[str, Any]:
-    w = h = 0; fps = dur = 0.0; br = 0; vcodec = acodec = fmt = None
+def _probe_basic(meta_json: Dict[str, Any]) -> Dict[str, Any]:
+    w = h = 0
+    fps = 0.0
+    dur = 0.0
+    br = 0
+    vcodec = acodec = fmt = None
     try:
-        for st in j.get("streams", []):
+        for st in meta_json.get("streams", []):
             if st.get("codec_type") == "video":
-                w = int(st.get("width") or 0); h = int(st.get("height") or 0)
+                w = int(st.get("width") or 0)
+                h = int(st.get("height") or 0)
                 r = st.get("r_frame_rate") or st.get("avg_frame_rate") or "0/1"
-                try: a, b = r.split("/"); fps = float(a) / max(1.0, float(b))
-                except Exception: fps = float(st.get("avg_frame_rate") or 0) or 0.0
+                try:
+                    a, b = r.split("/")
+                    fps = float(a) / max(1.0, float(b))
+                except Exception:
+                    fps = float(st.get("avg_frame_rate") or 0) or 0.0
                 vcodec = st.get("codec_name")
-                dur = float(st.get("duration") or j.get("format", {}).get("duration") or 0.0)
+                dur = float(st.get("duration") or meta_json.get("format", {}).get("duration") or 0.0)
             elif st.get("codec_type") == "audio":
                 acodec = st.get("codec_name")
-        fmt = (j.get("format") or {}).get("format_name")
-        br = int((j.get("format") or {}).get("bit_rate") or 0)
-    except Exception: pass
+        fmt = (meta_json.get("format") or {}).get("format_name")
+        br = int((meta_json.get("format") or {}).get("bit_rate") or 0)
+    except Exception:
+        pass
     return dict(width=w, height=h, fps=fps, duration=dur, bit_rate=br, vcodec=vcodec, acodec=acodec, format_name=fmt)
 
-def extract_wav_16k(path: str):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        wav_path = tmp.name
-    rc, out, err = run_cmd(["ffmpeg", "-hide_banner", "-y", "-i", path, "-ac", "1", "-ar", "16000", wav_path], timeout_s=45)
-    if rc != 0:
-        try: os.remove(wav_path)
-        except Exception: pass
-        return None, 0
+def _try_cv_meta(path: str) -> Dict[str, Any]:
+    # Import lazy per evitare pesi in startup
+    import cv2
     try:
-        import soundfile as sf
-        data, sr = sf.read(wav_path, dtype="float32", always_2d=False)
-        os.remove(wav_path)
-        return data, int(sr)
+        cv2.setNumThreads(1)
+        cv2.ocl.setUseOpenCL(False)
     except Exception:
-        try: os.remove(wav_path)
-        except Exception: pass
+        pass
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return {}
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    dur = float(frame_count / fps) if fps > 0 else 0.0
+    cap.release()
+    return {"width": w, "height": h, "fps": fps, "duration": dur}
+
+def _extract_wav_16k(path: str):
+    # Import lazy
+    import soundfile as sf
+    import numpy as np
+
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tmp.close()
+        cmd = ["ffmpeg", "-y", "-i", path, "-ac", "1", "-ar", "16000", "-f", "wav", tmp.name]
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        wav, sr = sf.read(tmp.name)
+        os.unlink(tmp.name)
+        if wav.ndim > 1:
+            wav = wav[:, 0]
+        return wav.astype(np.float32), sr
+    except Exception:
         return None, 0
 
-def compression_hint(bit_rate: int, w: int, h: int, fps: float) -> str:
-    if not bit_rate or not w or not h or not fps: return "unknown"
-    bpp = bit_rate / max(1.0, (w*h*fps))
-    if bpp < 0.05: return "heavy"
-    if bpp < 0.12: return "normal"
+def _calc_bpp(bit_rate: int, w: int, h: int, fps: float) -> float:
+    if not bit_rate or not w or not h or not fps:
+        return 0.0
+    px_per_s = w * h * fps
+    return float(bit_rate) / float(px_per_s)
+
+def _compression_from_bpp(bpp: float) -> str:
+    if bpp <= 0.06:
+        return "heavy"
+    if bpp <= 0.11:
+        return "normal"
     return "low"
 
+# ----- Core analyze -----
 def _analyze_file(path: str) -> Dict[str, Any]:
-    meta_json = ffprobe_json(path)
-    basic = basic_meta(meta_json)
+    meta_json = _run_ffprobe(path)
+    basic = _probe_basic(meta_json)
 
-    wav, sr = extract_wav_16k(path)
+    # fallback meta con OpenCV
+    if basic["width"] == 0 or basic["height"] == 0 or basic["fps"] == 0:
+        cvb = _try_cv_meta(path)
+        for k in ("width", "height", "fps", "duration"):
+            if (not basic.get(k)) and cvb.get(k):
+                basic[k] = cvb[k]
+
+    # AUDIO
+    wav, sr = _extract_wav_16k(path)
     duration_audio = float(len(wav) / sr) if (wav is not None and sr > 0) else 0.0
     audio = audio_an.analyze(wav, sr, duration_audio) if wav is not None else {
         "scores": {"audio_mean": 0.5}, "flags_audio": ["low_voice_presence"], "timeline": []
     }
 
+    # durata robusta
     if not basic["duration"] or basic["duration"] == 0:
-        if duration_audio > 0: basic["duration"] = duration_audio
+        if duration_audio > 0:
+            basic["duration"] = duration_audio
 
+    # backfill bit_rate da filesize/durata
     try:
         if (not basic["bit_rate"] or basic["bit_rate"] == 0) and basic["duration"] and basic["duration"] > 0:
             fsize_bits = os.path.getsize(path) * 8.0
             basic["bit_rate"] = int(fsize_bits / basic["duration"])
-    except Exception: pass
+    except Exception:
+        pass
 
-    video = video_an.analyze(path, sample_seconds=int(min(30, max(5, int(basic.get("duration") or 15)))))
-    v_summary = video.get("summary", {}) if isinstance(video, dict) else {}
+    # sanity-cap fps anomali
+    if basic["fps"] and basic["fps"] > 120.0:
+        basic["fps"] = 60.0
+
+    # VIDEO
+    video_has_signal = bool(basic["width"] and basic["height"] and basic["fps"])
+    if video_has_signal:
+        video = video_an.analyze(path, basic["fps"], basic["duration"])
+    else:
+        video = {"timeline": [], "summary": {}}
+    if not video.get("timeline"):
+        video_has_signal = False
+
+    # HINTS di base
+    bpp = _calc_bpp(basic.get("bit_rate") or 0, basic.get("width") or 0, basic.get("height") or 0, basic.get("fps") or 0.0)
     hints = {
-        "bpp": None,
-        "compression": compression_hint(basic["bit_rate"], basic["width"], basic["height"], basic["fps"]),
-        "video_has_signal": bool(video.get("timeline")),
-        "flow_used": float(v_summary.get("optflow_mag_avg") or 0.0),
-        "motion_used": float(v_summary.get("motion_avg") or 0.0),
-        "w": basic["width"], "h": basic["height"], "fps": basic["fps"], "br": basic["bit_rate"],
+        "bpp": bpp,
+        "compression": _compression_from_bpp(bpp) if bpp else "heavy",
+        "video_has_signal": video_has_signal,
+        "w": basic.get("width") or 0,
+        "h": basic.get("height") or 0,
+        "fps": basic.get("fps") or 0,
+        "br": basic.get("bit_rate") or 0
     }
 
+    # clamp timeline a durata
+    dur = float(basic.get("duration") or duration_audio or 0.0)
+    def _clamp_tl(tl):
+        out = []
+        for x in tl or []:
+            s = float(x.get("start", 0))
+            e = float(x.get("end", s + 1))
+            if s >= dur:
+                continue
+            e = min(e, dur)
+            out.append({"start": s, "end": e, "ai_score": float(x.get("ai_score", 0.5))})
+        return out
+
+    v_summary = video.get("summary") or {}
+    video_out = {
+        "timeline": _clamp_tl(video.get("timeline") or []),
+        "summary": v_summary,
+        "timeline_ai": [{"start": t["start"], "end": t["end"], "ai_score": t["ai_score"]} for t in _clamp_tl(video.get("timeline") or [])]
+    }
+    audio_out = {
+        "scores": audio.get("scores") or {},
+        "flags_audio": audio.get("flags_audio") or [],
+        "timeline": _clamp_tl(audio.get("timeline") or [])
+    }
+
+    # DEVICE
     dev = meta_an.detect_device(path) if hasattr(meta_an, "detect_device") else {"vendor": None, "model": None, "os": None}
-    if isinstance(dev, dict) and "device" in dev and isinstance(dev["device"], dict): dev = dev["device"]
+    if isinstance(dev, dict) and "device" in dev and isinstance(dev["device"], dict):
+        dev = dev["device"]
 
     meta_out = {
         "width": basic["width"], "height": basic["height"], "fps": basic["fps"], "duration": basic["duration"],
         "bit_rate": basic["bit_rate"], "vcodec": basic["vcodec"], "acodec": basic["acodec"], "format_name": basic["format_name"],
         "source_url": None, "resolved_url": None,
-        "forensic": forensic_an.analyze(path),
+        "forensic": {"c2pa": {"present": False}},
         "device": dev
     }
 
-    fused = fusion_an.fuse(audio, video, hints, duration_sec=float(basic["duration"] or 0.0))
+    hints["flow_used"] = float(v_summary.get("optflow_mag_avg") or 0.0)
+    hints["motion_used"] = float(v_summary.get("motion_avg") or 0.0)
+
+    hints = heur_an.build_hints(meta_out, video_out, audio_out, hints)
+    fused = fusion_an.fuse(meta_out, hints, video_out, audio_out)
 
     out = {
         "ok": True,
         "meta": meta_out,
+        "forensic": {"c2pa": {"present": meta_out.get("forensic", {}).get("c2pa", {}).get("present", False)}},
+        "video": video_out,
+        "audio": audio_out,
         "hints": hints,
         "result": fused["result"],
         "timeline_binned": fused["timeline_binned"],
@@ -139,80 +241,157 @@ def _analyze_file(path: str) -> Dict[str, Any]:
     }
     return out
 
-@app.get("/healthz")
-async def healthz():
-    return JSONResponse({"ok": True, "ffprobe": True, "exiftool": True, "version": VERSION, "author": "Backtato"})
-
-@app.get("/readyz")
-async def readyz(): return JSONResponse({"ok": True, "version": VERSION})
-
-@app.options("/{path:path}")
-async def options_all(path: str): return PlainTextResponse("", status_code=204)
-
-@app.api_route("/cors-test", methods=["GET", "POST", "OPTIONS"])
-async def cors_test(): return JSONResponse({"ok": True})
-
+# ----- Endpoints -----
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
+    """
+    Receives an uploaded video file and returns analysis results.
+    Streaming the upload in chunks avoids loading the entire file into memory. The
+    temporary file is always cleaned up after analysis.
+    """
+    # Basic validation on the incoming file
     if not file or not file.filename:
         raise HTTPException(status_code=415, detail={"error": "File vuoto o non ricevuto"})
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
-        try:
-            total = 0
-            while True:
-                chunk = await file.read(1024*1024)
-                if not chunk: break
-                tmp.write(chunk); total += len(chunk)
-                if total > MAX_UPLOAD_BYTES:
-                    os.unlink(tmp.name)
-                    return JSONResponse(status_code=413, content={"detail": f"File troppo grande (> {MAX_UPLOAD_BYTES} bytes)"})
-            path = tmp.name
-        except Exception as e:
-            return JSONResponse(status_code=400, content={"detail": "Errore lettura file", "error": str(e)})
+
+    # Create a temporary file for storing the uploaded data
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    total_bytes = 0
     try:
-        result = await asyncio.wait_for(asyncio.to_thread(_analyze_file, path), timeout=min(REQUEST_TIMEOUT_S, 150))
-        return JSONResponse(status_code=200, content=result)
-    except asyncio.TimeoutError:
-        return JSONResponse(status_code=504, content={"detail": "Analisi oltre il limite di tempo"})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": "Analyze error", "error": str(e)})
+        # Read the upload in chunks to avoid high memory usage
+        while True:
+            chunk = await file.read(1024 * 1024)  # 1 MB per iteration
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            # Reject files that exceed the configured maximum size
+            if total_bytes > MAX_UPLOAD_BYTES:
+                try:
+                    os.unlink(tmp.name)
+                finally:
+                    pass
+                raise HTTPException(status_code=413, detail={"error": "File troppo grande"})
+            tmp.write(chunk)
+        # Ensure some data was received
+        if total_bytes == 0:
+            raise HTTPException(status_code=415, detail={"error": "File vuoto"})
+        tmp.flush()
+
+        # Offload analysis to a background thread to avoid blocking the event loop
+        out = await asyncio.to_thread(_analyze_file, tmp.name)
+        return JSONResponse(out)
     finally:
-        try: os.remove(path)
-        except Exception: pass
+        # Always remove the temporary file
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
 
 @app.post("/analyze-url")
 async def analyze_url(url: str = Form(None), link: str = Form(None), q: str = Form(None)):
-    target = url or link or q
-    if not target: raise HTTPException(status_code=422, detail="Param url/link/q mancante")
-    if not USE_YTDLP:
-        return JSONResponse(status_code=415, content={"detail": "Per URL social abilita USE_YTDLP=1 oppure usa Carica file / Registra 10s"})
-    with tempfile.TemporaryDirectory() as td:
-        rc, out, err = run_cmd(["yt-dlp", "-f", "bv*+ba/best", "--no-playlist",
-                                "--socket-timeout", "15", "--retries", "2", "--fragment-retries", "1",
-                                "-o", f"{td}/vid.%(ext)s", target], timeout_s=60)
-        if rc != 0: return JSONResponse(status_code=422, content={"detail": "DownloadError", "yt_dlp": err[:400]})
-        vids = [p for p in os.listdir(td) if p.startswith("vid.")]
-        if not vids: return JSONResponse(status_code=415, content={"detail": "Nessun media scaricato"})
-        path = os.path.join(td, vids[0])
+    u = url or link or q
+    if not u:
+        raise HTTPException(status_code=422, detail="URL mancante")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp.close()
+    try:
+        cmd = ["yt-dlp", "-f", "mp4", "-o", tmp.name, u]
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        out = _analyze_file(tmp.name)
+        out["meta"]["source_url"] = u
+        out["meta"]["resolved_url"] = u
+        return JSONResponse(out)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=422, detail=f"DownloadError yt-dlp: {e}")
+    finally:
         try:
-            result = await asyncio.wait_for(asyncio.to_thread(_analyze_file, path), timeout=min(REQUEST_TIMEOUT_S, 150))
-            return JSONResponse(status_code=200, content=result)
-        except asyncio.TimeoutError:
-            return JSONResponse(status_code=504, content={"detail": "Analisi oltre il limite di tempo"})
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"detail": "Analyze error", "error": str(e)})
+            os.unlink(tmp.name)
+        except Exception:
+            pass
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(None), url: str = Form(None)):
-    if file is not None: return await analyze(file)
-    if url: return await analyze_url(url=url)
-    raise HTTPException(status_code=422, detail="Fornisci file o url")
+    if file is not None:
+        return await analyze(file)
+    if url:
+        return await analyze_url(url=url)
+    raise HTTPException(status_code=422, detail="Fornire file o url")
 
+# ----- Health/CORS super-leggeri -----
+@app.get("/healthz", response_class=JSONResponse)
+def healthz():
+    # IMPORTANTISSIMO: leggerissimo per Render
+    return {"ok": True}
+
+from functools import lru_cache
+from time import perf_counter
+import shutil as _shutil
+
+@lru_cache(maxsize=1)
+def _ready_probe():
+    t0 = perf_counter()
+    return {
+        "ffprobe_found": _shutil.which("ffprobe") is not None,
+        "exiftool_found": _shutil.which("exiftool") is not None,
+        "elapsed_ms": int((perf_counter()-t0)*1000),
+    }
+
+@app.get("/", response_class=JSONResponse)
+def root():
+    return {"ok": True, "service": "ai-video-detector", "version": VERSION}
+
+@app.get("/readyz", response_class=JSONResponse)
+def readyz():
+    return {"ok": True, **_ready_probe()}
+
+@app.options("/{path:path}")
+async def options_preflight(path: str):
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
+@app.post("/cors-test", response_class=JSONResponse)
+async def cors_test():
+    return {"ok": True, "message": "CORS OK"}
+
+# ----- Exception handlers puliti -----
 from fastapi.exceptions import RequestValidationError
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(status_code=422, content={"detail": "Validation error", "errors": exc.errors()})
+from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Invalid request", "errors": str(exc)}
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail if isinstance(exc.detail, (str, dict)) else str(exc)}
+    )
+
+# Catch-all handler for unexpected exceptions. Logging is used to capture
+# details on the server, and if DEBUG is enabled the response will include the
+# exception type and traceback for easier debugging. Without DEBUG the message
+# is generic to avoid leaking internals in production.
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error", "error": str(exc)})
+    # Log the exception for server-side visibility
+    logging.exception("Unhandled exception while processing request: %s", exc)
+    if DEBUG:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "detail": {
+                    "error": str(exc),
+                    "exception": exc.__class__.__name__,
+                    "traceback": traceback.format_exc(),
+                },
+            },
+        )
+    else:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "detail": {"error": "Internal server error"}},
+        )
