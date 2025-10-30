@@ -1,17 +1,13 @@
 fastapi>=0.111,<0.116
 uvicorn>=0.30,<0.32
 gunicorn>=21,<22
-python-multipart>=0.0.9,<0.0.10
+python-multipart==0.0.9
 requests>=2.32,<2.33
 httpx>=0.27,<0.28
 numpy>=1.26,<2.0
 opencv-python-headless>=4.10,<4.11
 librosa>=0.10,<0.11
 soundfile>=0.12,<0.14
-onnxruntime>=1.18,<1.19
-pymediainfo>=6.1,<7
-hachoir>=3.3,<3.4
+yt-dlp>=2024.10.0,<2026.0.0
 diskcache>=5.6,<5.7
-yt-dlp>=2024.10.0,<2026.0.0      # <— pin realistico e stabile
 scikit-learn>=1.5,<1.6
-matplotlib>=3.9,<3.10
