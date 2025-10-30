@@ -15,7 +15,7 @@ def c2pa_present(exif: dict) -> bool:
         return False
     return ("c2pa" in t) or ("jumbf" in t) or ("manifest" in t and "claim" in t)
 
-def detect_device(exif: dict) -> str | None:
+def detect_device(exif: dict):
     for k in ("QuickTime:Make","QuickTime:Model","EXIF:Make","EXIF:Model"):
         v = exif.get(k)
         if v: return str(v)
