@@ -1,12 +1,26 @@
-# AI-Video Detector (stable 1.2.x)
-FastAPI backend per analisi euristica di video/audio con output UI-friendly.
+# AI-Video Detector (FastAPI + Gunicorn)
+**Author:** Backtato
+
+- Limite upload configurabile via `MAX_UPLOAD_BYTES` (default **100 MB**).
+- Localizzazione automatica via `Accept-Language` / `X-Lang` / `?lang=`.
+
+Backend per stimare se un video Ã¨ **reale / parzialmente AI / AI**, con output:
+- `ai_score` (0=molto reale â€¦ 1=molto AI)
+- `label` (Con alta probabilitÃ  Ã¨ REALE / Esito incerto / Con alta probabilitÃ  Ã¨ AI)
+- `timeline` con segmenti sospetti
+- metadati (`width/height/fps/duration/bit_rate/codec`) e piccoli check forensi
 
 ## Endpoints
-- POST /analyze — upload file
-- POST /analyze-url — analizza URL (richiede USE_YTDLP=1 per social)
-- GET /healthz — health lightweight
-- GET /readyz — diagnostica semplice
-- GET|POST /cors-test — verifica CORS
 
-Soglie conservative (real ≤ 0.35, ai ≥ 0.72). Timeout duri per ffprobe/ffmpeg/yt-dlp.
-Output: result{label, ai_score, confidence, reason}, timeline_binned, peaks, hints.
+- `GET /healthz` â†’ `"ok"`
+- `POST /analyze` â†’ upload file (`form-data: file=@video.*`)
+- `POST /analyze-url` â†’ analizza link diretto a file video (`form-data: url=https://...`)
+  - blocca HLS `.m3u8` e HTML/login page
+  - social protetti (Instagram/TikTok ecc.): usa `USE_YTDLP=1` **con cookie**, oppure carica un file/registrazione schermo
+- `POST /predict` â†’ retro-compatibile: accetta **`file` o `url`**
+
+## Esempi `curl`
+
+Upload:
+```bash
+curl -sS -X POST "$BASE/analyze" -F "file=@/path/IMG_4568.mov" | jq
