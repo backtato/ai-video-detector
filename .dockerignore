@@ -14,8 +14,6 @@ __pycache__/
 # Env / IDE
 .env
 .venv
-venv/
-.env.local
 *.code-workspace
 .vscode/
 .idea/
@@ -30,4 +28,4 @@ build/
 
 # OS
 .DS_Store
-Thumbs.db 
+Thumbs.db
