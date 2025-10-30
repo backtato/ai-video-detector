@@ -6,12 +6,14 @@ services:
     healthCheckPath: /healthz
     autoDeploy: false
     envVars:
+      - key: VERSION
+        value: "1.2.3"
       - key: ALLOWED_ORIGINS
         value: "https://www.greensovereignfund.ch,https://greensovereignfund.ch"
       - key: MAX_UPLOAD_BYTES
-        value: "52428800"
+        value: "52428800"           # 50 MB
       - key: RESOLVER_MAX_BYTES
-        value: "125829120"
+        value: "125829120"          # 120 MB
       - key: REQUEST_TIMEOUT_S
         value: "180"
       - key: USE_YTDLP
