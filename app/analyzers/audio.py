@@ -39,20 +39,15 @@ def analyze(path: str, meta: dict):
 
         for i in range(0, len(wav), win):
             seg = wav[i:i+win]
-            if len(seg) == 0: 
+            if len(seg) == 0:
                 continue
-            # RMS
             rms.append(float(np.sqrt((seg**2).mean())))
-            # ZCR
             zc = np.mean(np.abs(np.diff(np.sign(seg))))/2.0
             zcr.append(float(zc))
-            # Spettro
             winseg = seg * np.hanning(len(seg))
             spec = np.fft.rfft(winseg)
             mag = np.abs(spec) + 1e-9
-            # Flatness
             flat.append(float(np.exp(np.mean(np.log(mag))) / np.mean(mag)))
-            # Rolloff ~85%
             cutoff = 0.85 * np.sum(mag)
             s = 0.0
             idx = 0
@@ -61,7 +56,6 @@ def analyze(path: str, meta: dict):
                 if s >= cutoff:
                     idx = k; break
             roll.append(float(idx) / max(1.0, len(mag)))
-            # Spectral centroid normalizzato
             freqs = np.linspace(0.0, 1.0, len(mag))
             sc = float(np.sum(freqs * mag) / np.sum(mag))
             sc_cent.append(sc)
@@ -72,42 +66,28 @@ def analyze(path: str, meta: dict):
         roll_arr = np.array(roll) if roll else np.zeros(1)
         sc_arr   = np.array(sc_cent) if sc_cent else np.zeros(1)
 
-        # Speech ratio: percentuale di finestre sopra la soglia 60° percentile
         speech_thr = np.percentile(rms_arr, 60) if rms_arr.size else 0.0
         speech_ratio = float(np.mean(rms_arr >= speech_thr)) if rms_arr.size else 0.0
 
-        # TTS-likeness proxy (meno “saturabile”):
-        #  - più flatness media → più TTS
-        #  - MA se centroid e rolloff variano molto → meno TTS (parlato umano è più irregolare)
         flat_mean = float(np.mean(flat_arr)) if flat_arr.size else 0.0
         sc_var    = float(np.var(sc_arr))    if sc_arr.size  else 0.0
         roll_var  = float(np.var(roll_arr))  if roll_arr.size else 0.0
         zcr_var   = float(np.var(zcr_arr))   if zcr_arr.size else 0.0
 
-        # base tts
         tts_base = 0.7 * flat_mean + 0.15 * (1.0/(1e-6 + zcr_var)) + 0.15 * (1.0/(1e-6 + roll_var))
-        # attenuazione: se centroid/rolloff/ZCR sono variabili, riduci TTS
         attenuation = 1.0 / (1.0 + 5.0 * (sc_var + roll_var + zcr_var))
         tts_like = float(np.clip(tts_base * attenuation, 0.0, 1.0))
 
-        # timeline sospetto audio: più flatness, meno variazioni istantanee → più sospetto
+        # Cap del TTS se la variabilità non è trascurabile
+        variability = sc_var + roll_var + zcr_var
+        if variability > 0.005:
+            tts_like = float(min(tts_like, 0.90))
+
         dzcr  = np.diff(np.concatenate([[zcr_arr[0] if zcr_arr.size else 0.0], zcr_arr])) if zcr_arr.size else np.zeros(1)
         droll = np.diff(np.concatenate([[roll_arr[0] if roll_arr.size else 0.0], roll_arr])) if roll_arr.size else np.zeros(1)
         tline = 0.5*_norm01(flat_arr) + 0.3*(1.0-_norm01(dzcr**2)) + 0.2*(1.0-_norm01(np.abs(droll)))
         tline = np.clip(tline, 0.0, 1.0).tolist()
 
-        # Gating: se c'è poco parlato, il canale audio incide meno sul sospetto AI
-        # (verrà sfruttato in fusion come riduzione peso)
-        flags = {
-            "speech_ratio": speech_ratio,
-            "tts_like": tts_like,
-            "rms_var": float(np.var(rms_arr)) if rms_arr.size else 0.0,
-            "zcr_var": zcr_var,
-            "roll_var": roll_var,
-            "sc_var": sc_var,
-        }
-
-        # clamp alla durata (secondi interi)
         tlen = int(max(1, round(dur)))
         if len(tline) < tlen:
             tline = tline + [tline[-1] if tline else 0.5] * (tlen - len(tline))
@@ -119,7 +99,14 @@ def analyze(path: str, meta: dict):
                 "speech_ratio": speech_ratio,
                 "tts_like": tts_like,
             },
-            "flags_audio": flags,
+            "flags_audio": {
+                "speech_ratio": speech_ratio,
+                "tts_like": tts_like,
+                "rms_var": float(np.var(rms_arr)) if rms_arr.size else 0.0,
+                "zcr_var": zcr_var,
+                "roll_var": roll_var,
+                "sc_var": sc_var,
+            },
             "timeline": tline
         }
     except Exception as e:
