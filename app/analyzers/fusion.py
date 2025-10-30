@@ -139,7 +139,7 @@ def fuse(meta: Dict[str, Any], hints: Dict[str, Any], video: Dict[str, Any], aud
     device = (meta or {}).get("device") or {}
     if (device.get("vendor") == "Apple" or device.get("os") == "iOS") and (hints or {}).get("video_has_signal", False):
         if (bpp >= 0.08) and (comp in (None, "normal", "low")) and ((flow_avg and flow_avg > 1.0) or (motion_avg and motion_avg >= 5.0)):
-            adjust -= 0.05  # più favore al "real"
+            adjust -= 0.05  # piÃ¹ favore al "real"
 
     fused_avg_adj = _clamp(fused_avg + adjust, 0.0, 1.0)
 
