@@ -7,7 +7,8 @@ services:
     autoDeploy: false      # <— disattiva auto-deploy per NON consumare pipeline minutes
     envVars:
       - key: ALLOWED_ORIGINS
-        value: "https://www.greensovereignfund.ch"
+        # Consenti sia il dominio con www che senza per il frontend
+        value: "https://www.aurora-noor.com,https://aurora-noor.com"
       # In alternativa:
       # - key: ALLOWED_ORIGIN_REGEX
       #   value: "^https://(www\\.)?greensovereignfund\\.ch$"
