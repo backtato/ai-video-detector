@@ -11,7 +11,7 @@ services:
         value: "https://www.aurora-noor.com,https://aurora-noor.com"
       # In alternativa:
       # - key: ALLOWED_ORIGIN_REGEX
-      #   value: "^https://(www\\.)?greensovereignfund\\.ch$"
+      #   value: "^https://(www\\.)?aurora-noor\\.com$"
 
       - key: MAX_UPLOAD_BYTES
         value: "104857600"        # 100 MB
