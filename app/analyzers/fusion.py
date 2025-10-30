@@ -28,16 +28,15 @@ def fuse(audio: dict, video: dict, hints: dict):
     w_video = 0.25
     bonus_agree = 0.10 if np.sign(np.mean(a)-0.5) == np.sign(np.mean(v)-0.5) else 0.0
 
-    # Dinamica pesi dal parlato: se poco parlato → riduci impatto audio
+    # Dinamica pesi dal parlato
     flags = audio.get("flags_audio", {})
     speech_ratio = float(flags.get("speech_ratio", 0.0))
     tts_like = float(flags.get("tts_like", 0.0))
     if speech_ratio < 0.25:
-        w_audio *= 0.6  # meno impatto dell'audio
-        w_video = 1.0 - w_audio - bonus_agree
-        w_video = max(0.2, w_video)
+        w_audio *= 0.6
+        w_video = max(0.2, 1.0 - w_audio - bonus_agree)
 
-    # Penalità da qualità/compressione/duplicati
+    # Penalità qualità/compressione/duplicati
     comp = hints.get("compression", "normal")
     bpp  = hints.get("bpp", 0.0)
     dup  = hints.get("dup_avg", 0.0)
@@ -46,40 +45,37 @@ def fuse(audio: dict, video: dict, hints: dict):
     if bpp < 0.07: penalties += 0.05
     if dup > 0.2: penalties += 0.05
 
-    # Bonus "ripresa reale" da summary video (molto motion + texture + niente duplicati)
+    # Bonus “ripresa reale”
     vsum = video.get("summary", {}) or {}
     flow_mean = float(vsum.get("flow_mean", 0.0))
     texture_var = float(vsum.get("texture_var", 0.0))
     sc_rate = float(vsum.get("scene_change_rate", 0.0))
     dup_density = float(vsum.get("dup_density", 0.0))
 
-    # Se ci sono segnali forti da ripresa reale, abbassiamo sospetto
     real_bonus = 0.0
     if flow_mean > 5.0 and texture_var > 200.0 and dup_density < 0.05:
-        real_bonus -= 0.10  # sposta verso REALE
+        real_bonus -= 0.10
     if sc_rate > 0.7:
-        real_bonus -= 0.05  # tanti cambi scena → tipico riprese reali montate/variate
+        real_bonus -= 0.05
+    if sc_rate >= 0.9 and texture_var > 300.0 and dup_density < 0.02:
+        real_bonus -= 0.08
 
-    # Se audio “sembra TTS” ma il parlato è variabile, riduci il suo peso
-    zcr_var = float(flags.get("zcr_var", 0.0))
-    roll_var = float(flags.get("roll_var", 0.0))
-    sc_var = float(flags.get("sc_var", 0.0))
-    variability = zcr_var + roll_var + sc_var
-    if tts_like >= 0.85 and variability > 0.01:
-        w_audio *= 0.7  # smorza l'impatto del TTS-high quando il parlato varia “da umano”
+    # Se tts_like molto alto ma video fortemente reale → smorza ancora l'audio
+    if tts_like >= 0.95 and flow_mean > 8.0 and texture_var > 300.0 and dup_density < 0.05:
+        w_audio *= 0.55
+        w_video = max(0.25, 1.0 - w_audio - bonus_agree)
 
     # Combinazione
     timeline = (w_audio*a + w_video*v + bonus_agree*(a+v)/2.0) - penalties + real_bonus
     timeline = np.clip(timeline, 0.0, 1.0)
 
-    # Peaks esclusi attorno a 0.5
+    # Picchi (escludi ~0.5)
     peaks = [i for i, x in enumerate(timeline.tolist()) if x <= 0.25 or x >= 0.75]
 
     score = float(np.mean(timeline))
     spread = float(np.std(timeline))
-
-    # Confidenza: disaccordo forte → confidenza bassa
     disagree = float(abs(np.mean(a) - np.mean(v)))
+
     conf = float(np.clip(0.20 + 2.2*spread - penalties - 0.5*max(0.0, 0.3 - disagree), 0.10, 0.99))
 
     if score <= THRESH_REAL_MAX:
