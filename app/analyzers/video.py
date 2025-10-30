@@ -1,10 +1,17 @@
 import cv2
 import numpy as np
 
-def _frame_hash(img):
-    x = cv2.resize(img, (32, 32))
-    x = cv2.cvtColor(x, cv2.COLOR_BGR2GRAY)
-    return cv2.img_hash.AverageHash_create().compute(x)
+def _average_hash(img, size=32):
+    """
+    Implementazione leggera di Average Hash:
+    - resize grayscale a NxN
+    - media dei pixel
+    - ritorna un vettore booleano (flatten)
+    """
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(g, (size, size), interpolation=cv2.INTER_AREA)
+    mean = g.mean()
+    return (g >= mean).astype(np.uint8).flatten()
 
 def analyze(path: str, meta: dict):
     cap = cv2.VideoCapture(path)
@@ -14,9 +21,10 @@ def analyze(path: str, meta: dict):
     w = meta.get("width") or int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     h = meta.get("height") or int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     duration = meta.get("duration") or (cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps if fps>0 else 0.0)
+
     # sample ~2 fps
     step = max(1, int(round((fps or 30)/2)))
-    prev = None
+    prev_hash = None
     dup = 0
     total = 0
     flow_means = []
@@ -25,6 +33,7 @@ def analyze(path: str, meta: dict):
     timeline_ai = []
 
     index = 0
+    prev_frame_small = None
     while True:
         ret = cap.grab()
         if not ret:
@@ -33,26 +42,33 @@ def analyze(path: str, meta: dict):
             ok, frame = cap.retrieve()
             if not ok: break
             total += 1
-            # duplicate detection
-            hsh = _frame_hash(frame)
-            if prev is not None and (hsh == prev).all():
-                dup += 1
-            prev = hsh
-            # flow vs previous sampled frame (use grayscale small)
-            if 'prev_frame' in locals():
-                a = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-                b = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                a = cv2.resize(a, (320, 320)); b = cv2.resize(b, (320, 320))
-                flow = cv2.calcOpticalFlowFarneback(a, b, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+
+            # duplicate detection via avg-hash
+            hsh = _average_hash(frame, size=32)
+            if prev_hash is not None:
+                # Hamming distance; se 0 => duplicato perfetto
+                ham = int(np.sum(hsh ^ prev_hash))
+                if ham == 0:
+                    dup += 1
+            prev_hash = hsh
+
+            # optical flow (Farneback) su frames ridotti
+            small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (320, 320))
+            if prev_frame_small is not None:
+                flow = cv2.calcOpticalFlowFarneback(prev_frame_small, small, None, 0.5, 3, 15, 3, 5, 1.2, 0)
                 mag = np.sqrt(flow[...,0]**2 + flow[...,1]**2)
                 flow_means.append(float(np.mean(mag)))
                 flow_vars.append(float(np.var(mag)))
-            prev_frame = frame
-            # texture flatness via Laplacian variance (low => flat)
+            prev_frame_small = small
+
+            # texture flatness via var(Laplacian)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             textures.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
-            # simple per-sample ai suspicion: very flat + low motion → higher AI suspicion
-            ai_susp = float(np.clip(1.0 - (textures[-1]/(textures[-1]+1000.0)) * (1.0 + (flow_means[-1] if flow_means else 0.0)), 0.0, 1.0))
+
+            # semplice indice di "AI-suspicion": bassa texture + bassa motion → più alto
+            tex = textures[-1]
+            mot = flow_means[-1] if flow_means else 0.0
+            ai_susp = float(np.clip(1.0 - (tex/(tex+1000.0)) * (1.0 + mot), 0.0, 1.0))
             timeline_ai.append(ai_susp)
         index += 1
     cap.release()
@@ -68,10 +84,10 @@ def analyze(path: str, meta: dict):
         "texture_var": float(np.var(textures)) if textures else 0.0,
         "w": int(w), "h": int(h), "fps": float(fps)
     }
-    # align timeline length to seconds
+
+    # allinea la timeline ai secondi
     tlen = int(max(1, round(duration)))
     if len(timeline_ai) < tlen:
-        # simple repeat to fill
         if timeline_ai:
             last = timeline_ai[-1]
             timeline_ai += [last]*(tlen-len(timeline_ai))
@@ -79,4 +95,5 @@ def analyze(path: str, meta: dict):
             timeline_ai = [0.5]*tlen
     else:
         timeline_ai = timeline_ai[:tlen]
+
     return {"timeline": timeline_ai, "summary": summary, "timeline_ai": timeline_ai}
