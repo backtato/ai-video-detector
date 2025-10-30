@@ -116,14 +116,39 @@ def _ready_probe() -> Dict[str, Any]:
         "author": "Backtato",
     }
 
+async def _safe_audio(path: str, meta: dict) -> tuple[dict, dict]:
+    """Esegue l'analisi audio con gestione errori: in caso di failure ritorna timeline neutrale e hint."""
+    hints_extra = {}
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(audio_an.analyze, path, meta), timeout=REQUEST_TIMEOUT_S), hints_extra
+    except Exception as e:
+        tlen = int(max(1, round(meta.get("duration") or 0.0)))
+        neutral = {"scores": {}, "flags_audio": {"error": str(e.__class__.__name__)}, "timeline": [0.5]*tlen}
+        hints_extra["audio_error"] = f"{e.__class__.__name__}"
+        if DEBUG:
+            hints_extra["audio_traceback"] = traceback.format_exc()
+        return neutral, hints_extra
+
+async def _safe_video(path: str, meta: dict) -> tuple[dict, dict]:
+    """Esegue l'analisi video con gestione errori: in caso di failure ritorna timeline neutrale e hint."""
+    hints_extra = {}
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(video_an.analyze, path, meta), timeout=REQUEST_TIMEOUT_S), hints_extra
+    except Exception as e:
+        tlen = int(max(1, round(meta.get("duration") or 0.0)))
+        neutral = {"timeline": [0.5]*tlen, "summary": {"error": str(e.__class__.__name__)}, "timeline_ai": [0.5]*tlen}
+        hints_extra["video_error"] = f"{e.__class__.__name__}"
+        if DEBUG:
+            hints_extra["video_traceback"] = traceback.format_exc()
+        return neutral, hints_extra
+
 async def _analyze_path(path: str, source_url: Optional[str]=None, resolved_url: Optional[str]=None) -> Dict[str, Any]:
     meta = _probe_basic_meta(path)
     hints = hx.compute_hints(meta, path)
-    # Run audio/video in threads to avoid blocking
-    audio_task = asyncio.to_thread(audio_an.analyze, path, meta)
-    video_task = asyncio.to_thread(video_an.analyze, path, meta)
-    audio = await asyncio.wait_for(audio_task, timeout=REQUEST_TIMEOUT_S)
-    video = await asyncio.wait_for(video_task, timeout=REQUEST_TIMEOUT_S)
+    # Run audio/video safely (no crash → neutral fallback)
+    audio, a_hint = await _safe_audio(path, meta)
+    video, v_hint = await _safe_video(path, meta)
+    hints.update(a_hint); hints.update(v_hint)
     fused = fusion_an.fuse(audio, video, hints)
     out = {
         "ok": True,
@@ -150,7 +175,6 @@ async def _analyze_path(path: str, source_url: Optional[str]=None, resolved_url:
     return out
 
 def _yt_dlp_download(url: str, max_bytes: int) -> Dict[str, Any]:
-    """Download a media file using yt-dlp without cookies."""
     if not USE_YTDLP:
         raise HTTPException(422, detail={"error":"yt-dlp disabilitato","hint":"Abilita USE_YTDLP=1"})
     import yt_dlp
@@ -197,7 +221,6 @@ def root():
 
 @app.get("/healthz", response_class=JSONResponse)
 def healthz():
-    # as-light-as-possible
     return {"ok": True, "version": VERSION}
 
 @app.get("/readyz", response_class=JSONResponse)
@@ -218,7 +241,6 @@ async def cors_test(request: Request):
 async def analyze(file: UploadFile = File(...)):
     if not file:
         raise HTTPException(415, detail={"error":"File vuoto o non ricevuto"})
-    # Save to tmp (chunked)
     path = _save_upload_to_tmp(file, MAX_UPLOAD_BYTES)
     try:
         result = await asyncio.wait_for(_analyze_path(path), timeout=REQUEST_TIMEOUT_S)
