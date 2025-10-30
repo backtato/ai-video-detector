@@ -1,16 +1,12 @@
-## Aurora-Noor Detector — Backend (FastAPI)
+# AI-Video Detector (stable 1.2.x)
+FastAPI backend per analisi euristica di video/audio con output UI-friendly.
 
-**Versione:** 1.2.x  
-**Autore:** Backtato / Adriano Brutti  
-**Licenza:** MIT  
-**Deploy compatibile:** [Render](https://render.com), Docker, o qualsiasi hosting Python 3.11+
+## Endpoints
+- POST /analyze — upload file
+- POST /analyze-url — analizza URL (richiede USE_YTDLP=1 per social)
+- GET /healthz — health lightweight
+- GET /readyz — diagnostica semplice
+- GET|POST /cors-test — verifica CORS
 
----
-
-##  Descrizione
-
-**AI-Video Detector** è un backend scritto in **FastAPI** che analizza video e audio per stimare, con logica euristica e parametri conservativi, se un contenuto è **reale**, **generato da AI** o **incerto**.  
-L’analisi combina segnali **video (frame, movimento, artefatti)** e **audio (voce, ritmo, musica)**, restituendo un punteggio normalizzato e un motivo sintetico del verdetto.
-
-Questo backend è pensato per essere usato con il **plugin WordPress “AI-Video Detector”** (shortcode `[ai_video_checker]` ma può anche funzionare da API standalone.
-
+Soglie conservative (real ≤ 0.35, ai ≥ 0.72). Timeout duri per ffprobe/ffmpeg/yt-dlp.
+Output: result{label, ai_score, confidence, reason}, timeline_binned, peaks, hints.
