@@ -201,7 +201,8 @@ def _analyze_file(path: str) -> Dict[str, Any]:
     video_out = {
         "timeline": _clamp_tl(video.get("timeline") or []),
         "summary": v_summary,
-        "timeline_ai": [{"start": t["start"], "end": t["end"], "ai_score": t["ai_score"]} for t in _clamp_tl(video.get("timeline") or [])]
+        "timeline_ai": [{"start": t["start"], "end": t["end"], "ai_score": t["ai_score"]}
+                        for t in _clamp_tl(video.get("timeline") or [])]
     }
     audio_out = {
         "scores": audio.get("scores") or {},
@@ -245,25 +246,25 @@ def _analyze_file(path: str) -> Dict[str, Any]:
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     """
-    Receives an uploaded video file and returns analysis results.
-    Streaming the upload in chunks avoids loading the entire file into memory. The
-    temporary file is always cleaned up after analysis.
+    Riceve un file video caricato e restituisce i risultati dell’analisi.
+    Lo streaming dell’upload evita di caricare il file interamente in RAM.
+    Il file temporaneo viene sempre eliminato.
     """
-    # Basic validation on the incoming file
+    # Validazione di base
     if not file or not file.filename:
         raise HTTPException(status_code=415, detail={"error": "File vuoto o non ricevuto"})
 
-    # Create a temporary file for storing the uploaded data
+    # Crea un file temporaneo
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     total_bytes = 0
     try:
-        # Read the upload in chunks to avoid high memory usage
+        # Legge il caricamento a blocchi (1 MB)
         while True:
-            chunk = await file.read(1024 * 1024)  # 1 MB per iteration
+            chunk = await file.read(1024 * 1024)
             if not chunk:
                 break
             total_bytes += len(chunk)
-            # Reject files that exceed the configured maximum size
+            # Rifiuta file troppo grandi
             if total_bytes > MAX_UPLOAD_BYTES:
                 try:
                     os.unlink(tmp.name)
@@ -271,16 +272,23 @@ async def analyze(file: UploadFile = File(...)):
                     pass
                 raise HTTPException(status_code=413, detail={"error": "File troppo grande"})
             tmp.write(chunk)
-        # Ensure some data was received
+        # Nessun dato ricevuto
         if total_bytes == 0:
             raise HTTPException(status_code=415, detail={"error": "File vuoto"})
+        # Flush e chiusura del file temporaneo prima dell’analisi
         tmp.flush()
+        tmp.close()
 
-        # Offload analysis to a background thread to avoid blocking the event loop
-        out = await asyncio.to_thread(_analyze_file, tmp.name)
+        try:
+            # Esegue l’analisi in un thread secondario con timeout
+            out = await asyncio.wait_for(
+                asyncio.to_thread(_analyze_file, tmp.name), timeout=REQUEST_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Analisi oltre il limite di tempo")
         return JSONResponse(out)
     finally:
-        # Always remove the temporary file
+        # Cancella sempre il file temporaneo
         try:
             os.unlink(tmp.name)
         except Exception:
@@ -370,13 +378,10 @@ async def http_exception_handler(request, exc):
         content={"detail": exc.detail if isinstance(exc.detail, (str, dict)) else str(exc)}
     )
 
-# Catch-all handler for unexpected exceptions. Logging is used to capture
-# details on the server, and if DEBUG is enabled the response will include the
-# exception type and traceback for easier debugging. Without DEBUG the message
-# is generic to avoid leaking internals in production.
+# Catch-all handler per eccezioni inattese.
+# Se DEBUG=1 restituisce stacktrace e nome dell’eccezione; altrimenti un messaggio generico.
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    # Log the exception for server-side visibility
     logging.exception("Unhandled exception while processing request: %s", exc)
     if DEBUG:
         return JSONResponse(
